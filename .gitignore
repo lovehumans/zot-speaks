@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target/
+
+# Built binaries: build them yourself, never commit them
+/zot-speaks
+/zot-speaks.new
+/ptts
+
+# Local runtime state written by the extension inside its install directory
+/settings.json
+
+# Scratch from manual runs
+out.wav
+*.tmp
