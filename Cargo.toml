@@ -1,0 +1,21 @@
+[package]
+name = "zot-speaks"
+version = "1.7.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "zot-speaks"
+path = "src/main.rs"
+
+[dependencies]
+# `hf` gives cache-only model/voice resolution (no network, no TLS stack). We deliberately do
+# NOT enable `hub`: it pulls ureq -> rustls -> platform ring/assembly that cannot build in this
+# Landlock sandbox, and "local-only by design" means we never download at runtime anyway.
+ptts = { version = "0.4.0", default-features = false, features = ["hf"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
