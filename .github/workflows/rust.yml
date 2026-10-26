@@ -24,6 +24,9 @@ jobs:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0
+        # checkout fetches with --no-tags by default: fetch-depth: 0 alone gives full
+        # history but no tag refs, and the tag detection below then finds nothing (v1.7.4).
+        fetch-tags: true
     - name: Build
       run: cargo build --release --verbose
     - name: Run tests
@@ -41,11 +44,14 @@ jobs:
     - name: Attach it to the tag's release
       if: steps.tag.outputs.tag != ''
       run: |
+        tag="${{ steps.tag.outputs.tag }}"
         sha=$(cut -d' ' -f1 SHA256SUMS)
         printf 'Built with cargo build --release on ubuntu-latest by GitHub Actions.\n\nsha256: %s\n' "$sha" > NOTES
-        gh release create "${{ steps.tag.outputs.tag }}" \
-          --title "zot-speaks ${{ steps.tag.outputs.tag }}" \
-          --notes-file NOTES \
-          zot-speaks SHA256SUMS
+        if gh release view "$tag" >/dev/null 2>&1; then
+          echo "release $tag already exists; refreshing its assets instead of failing"
+        else
+          gh release create "$tag" --title "zot-speaks $tag" --notes-file NOTES
+        fi
+        gh release upload "$tag" zot-speaks SHA256SUMS --clobber
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

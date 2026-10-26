@@ -55,7 +55,51 @@ the row cycles `off → here → everywhere`.
 
 ## Install
 
-You build it once; zot runs it from then on. Nothing is downloaded at runtime.
+Install once; zot runs it from then on. Nothing is ever downloaded at runtime.
+
+The repository holds sources only — no binary is committed. GitHub Actions compiles one on every
+version tag and attaches it to that tag's [Release](https://github.com/lovehumans/zot-speaks/releases)
+as `zot-speaks` (x86-64 Linux) together with a `SHA256SUMS` file; the release notes print the same
+digest. Fetch, verify, install:
+
+```sh
+git clone https://github.com/lovehumans/zot-speaks
+cd zot-speaks
+curl -fsSL -o zot-speaks https://github.com/lovehumans/zot-speaks/releases/latest/download/zot-speaks
+curl -fsSL -o SHA256SUMS https://github.com/lovehumans/zot-speaks/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS        # must print: zot-speaks: OK
+stage="$(mktemp -d)/zot-speaks"; mkdir -p "$stage"
+cp extension.json "$stage/"; mv zot-speaks "$stage/"
+zot ext install "$stage"
+```
+
+The clone supplies `extension.json` — the manifest zot needs — and the license; the release supplies
+the binary. Verify before installing: `sha256sum -c` fails loudly on a truncated or tampered
+download, and you can cross-check the printed hash against the release notes. To pin a version
+instead of taking the newest, replace `latest` with the tag in both URLs:
+`releases/download/v1.7.5/…`.
+
+Restart zot: `zot ext doctor` should list `zot-speaks` with `/tts` and `/tts-settings` active.
+
+**Updating.** Download the new binary and swap it inside the installed directory; your settings
+(voice, favourites, per-project auto-speak) live in `settings.json` there and travel untouched:
+
+```sh
+installed="$HOME/.local/state/zot/extensions/zot-speaks"   # or <project>/.zot/extensions/…
+tmp="$(mktemp -d)"
+curl -fsSL -o "$tmp/zot-speaks" https://github.com/lovehumans/zot-speaks/releases/latest/download/zot-speaks
+curl -fsSL -o "$tmp/SHA256SUMS" https://github.com/lovehumans/zot-speaks/releases/latest/download/SHA256SUMS
+( cd "$tmp" && sha256sum -c SHA256SUMS )
+cp "$tmp/zot-speaks" "$installed/zot-speaks.new"
+mv -f "$installed/zot-speaks.new" "$installed/zot-speaks"   # atomic swap on one filesystem
+```
+
+A running zot keeps the old binary open; the new one takes effect at the next zot start.
+
+### Installing by building from source
+
+The same result, compiled on your machine instead of the Actions runner — the route to take on
+architectures other than x86-64, or whenever you prefer to build what you run:
 
 ```sh
 git clone https://github.com/lovehumans/zot-speaks
@@ -63,7 +107,6 @@ cd zot-speaks
 just install-ext      # cargo build --release, then zot ext install
 ```
 
-Restart zot: `zot ext doctor` should list `zot-speaks` with `/tts` and `/tts-settings` active.
 Without `just`, the same two steps are:
 
 ```sh
@@ -78,9 +121,8 @@ Copying the directory into `$ZOT_HOME/extensions/zot-speaks/` (or
 named by `extension.json` (`./zot-speaks`) sits next to `extension.json`. Settings are kept in
 `settings.json` inside the installed directory, so they travel with it.
 
-**Updating.** `zot ext install` refuses to overwrite an existing installation. To keep your
-settings (voice, favourites, per-project auto-speak), swap the binary inside the installed
-directory:
+**Updating a source install.** `zot ext install` refuses to overwrite an existing installation. To
+keep your settings, swap the freshly built binary inside the installed directory:
 
 ```sh
 just update-ext        # same directory, new binary, settings.json untouched
@@ -123,6 +165,9 @@ Do this before starting zot, or restart zot afterwards: a running extension has 
 catalog, so voices you fetch mid-session join the picker on the next zot start.
 
 ## Build
+
+This is also exactly how the release binary is produced: CI runs `cargo build --release` on
+every version tag, so `just build` and the Release asset are the same kind of artifact.
 
 ```sh
 just build      # cargo build --release   ->  target/release/zot-speaks
