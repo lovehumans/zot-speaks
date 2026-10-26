@@ -1,6 +1,6 @@
 {
   "name": "zot-speaks",
-  "version": "1.7.5",
+  "version": "1.7.6",
   "exec": "./zot-speaks",
   "args": [],
   "language": "rust",

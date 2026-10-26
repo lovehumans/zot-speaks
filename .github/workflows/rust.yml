@@ -27,6 +27,25 @@ jobs:
         # checkout fetches with --no-tags by default: fetch-depth: 0 alone gives full
         # history but no tag refs, and the tag detection below then finds nothing (v1.7.4).
         fetch-tags: true
+    # Cache the crate downloads and the compiled dependency graph. The key follows
+    # Cargo.lock: while the lockfile is unchanged every run restores ~/.cargo (crate
+    # files, sparse index) and target/ (compiled dependencies), so cargo re-downloads
+    # nothing and re-compiles only this crate — checkout gives src/ fresh mtimes, but
+    # the registry crates keep their cached mtimes and cargo considers them fresh.
+    # Caches are repository-wide: main seeds them, PRs and later runs read them
+    # (a branch can read caches from the default branch); unused caches expire in 7 days.
+    - name: Cache cargo registry and build artifacts
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
     - name: Build
       run: cargo build --release --verbose
     - name: Run tests
