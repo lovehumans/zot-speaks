@@ -39,11 +39,10 @@ jobs:
       run: |
         sha256sum target/release/zot-speaks > SHA256SUMS
         sha=$(cut -d' ' -f1 SHA256SUMS)
+        printf 'Built with cargo build --release on ubuntu-latest by GitHub Actions.\n\nsha256: %s\n' "$sha" > NOTES
         gh release create "$GITHUB_REF_NAME" \
           --title "zot-speaks $GITHUB_REF_NAME" \
-          --notes "Built with cargo build --release on ubuntu-latest by GitHub Actions.
-
-sha256: $sha" \
+          --notes-file NOTES \
           target/release/zot-speaks SHA256SUMS
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
