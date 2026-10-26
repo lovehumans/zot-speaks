@@ -1,9 +1,12 @@
 name: Rust
 
+# One job, one compile per push. The release is decided inside that same run:
+# if the pushed commit carries a v* tag, the already-built binary is packaged
+# and attached to that tag's GitHub Release. A separate tag trigger would
+# start a second run that compiles the same commit a second time.
 on:
   push:
     branches: [ "main" ]
-    tags: [ "v*" ]
   pull_request:
     branches: [ "main" ]
 
@@ -14,35 +17,35 @@ jobs:
   build:
 
     runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
-
-  # On a version tag, build the release binary and attach it to that tag's
-  # GitHub Release, with its sha256, so installers can fetch a built binary
-  # while the repository itself stays sources-only.
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
     - uses: actions/checkout@v4
-    - name: Build the release binary
-      run: cargo build --release
-    - name: Attach it to the tag's release
+      with:
+        fetch-depth: 0
+    - name: Build
+      run: cargo build --release --verbose
+    - name: Run tests
+      run: cargo test --release --verbose
+    - name: Detect a release tag on this commit
+      id: tag
       run: |
-        sha256sum target/release/zot-speaks > SHA256SUMS
+        tag=$(git tag --points-at HEAD | grep '^v' | sort -V | tail -n1 || true)
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+    - name: Package the release binary
+      if: steps.tag.outputs.tag != ''
+      run: |
+        install -m 0755 target/release/zot-speaks zot-speaks
+        sha256sum zot-speaks > SHA256SUMS
+    - name: Attach it to the tag's release
+      if: steps.tag.outputs.tag != ''
+      run: |
         sha=$(cut -d' ' -f1 SHA256SUMS)
         printf 'Built with cargo build --release on ubuntu-latest by GitHub Actions.\n\nsha256: %s\n' "$sha" > NOTES
-        gh release create "$GITHUB_REF_NAME" \
-          --title "zot-speaks $GITHUB_REF_NAME" \
+        gh release create "${{ steps.tag.outputs.tag }}" \
+          --title "zot-speaks ${{ steps.tag.outputs.tag }}" \
           --notes-file NOTES \
-          target/release/zot-speaks SHA256SUMS
+          zot-speaks SHA256SUMS
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
