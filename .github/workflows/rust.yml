@@ -3,6 +3,7 @@ name: Rust
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main" ]
 
@@ -20,3 +21,29 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+
+  # On a version tag, build the release binary and attach it to that tag's
+  # GitHub Release, with its sha256, so installers can fetch a built binary
+  # while the repository itself stays sources-only.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build the release binary
+      run: cargo build --release
+    - name: Attach it to the tag's release
+      run: |
+        sha256sum target/release/zot-speaks > SHA256SUMS
+        sha=$(cut -d' ' -f1 SHA256SUMS)
+        gh release create "$GITHUB_REF_NAME" \
+          --title "zot-speaks $GITHUB_REF_NAME" \
+          --notes "Built with cargo build --release on ubuntu-latest by GitHub Actions.
+
+sha256: $sha" \
+          target/release/zot-speaks SHA256SUMS
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
