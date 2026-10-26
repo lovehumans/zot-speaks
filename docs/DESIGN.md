@@ -209,16 +209,18 @@ Model and voice snapshots are looked up under the first of:
 
 ### One-time bootstrap
 
-Cache the model once (the extension then only reads it):
+`just bootstrap` fills the cache the extension then reads (`just fetch-model` and `just fetch-voices`
+are its two halves; `just cache` reports the result). Underneath they are the `ptts` CLI and
+`dev/prefetch-en-voices.sh`, and the same thing by hand is:
 
 ```sh
-./ptts --voice Miles "warm-up"                 # fetches model + one voice together
-# or explicitly:
+ptts --voice Miles "warm up"                   # fetches model + one voice together
+# or explicitly, with the huggingface CLI:
 hf download gradium/phonon-31m-en
 hf download gradium/phonon-voices voices.jsonl voices/<file>.safetensors
 ```
 
-To make the **whole English catalog** ready in one go, use the companion script. It reads
+To make the **whole English catalog** ready in one go, the companion script reads
 `voices.jsonl` straight out of the cache, skips what is already there, and synthesises once per
 missing voice so `ptts` fetches that voice's embedding:
 

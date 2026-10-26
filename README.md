@@ -99,25 +99,25 @@ mv -f "$installed/zot-speaks.new" "$installed/zot-speaks"
 
 ### One-time bootstrap
 
-Cache the model and at least one voice (250 kiB) once, with the upstream `ptts` CLI on your `PATH`
-(a `./ptts` next to these scripts works too). The first command fetches model and voice together:
+`zot-speaks` never downloads: it only reads the Hugging Face cache. Filling that cache is the one
+network step, and it needs the upstream `ptts` CLI on your `PATH` — get it from the [official
+releases](https://github.com/gradium-ai/xn-ptts/releases).
 
 ```sh
-ptts --voice Miles "warm-up"
+just bootstrap   # the model (~102 MB) plus all 37 English voices (~9 MiB), once
+just cache       # what the extension can see right now: snapshot, and how many voices are ready
 ```
+
+Or in pieces. `just fetch-model` fetches the model and one voice in a single run (`just fetch-model
+VOICE=Aria` chooses the voice). `just fetch-voices` fills the rest of the English catalog and skips
+whatever is already cached, so re-running it is also the coverage check: it prints
+`fetched/skipped/failed` counts. Both are thin wrappers over `dev/prefetch-en-voices.sh` and the
+`ptts` CLI, so `ptts --voice Miles "warm up"` does the first half by hand too.
 
 You can listen to individual voices [here](https://huggingface.co/gradium/phonon-voices).
 
-Get ptts from the [official releases](https://github.com/gradium-ai/xn-ptts/releases).
-
-To make the whole English catalog (9 MiB) ready, run the companion script. It reads the voice catalog from
-your cache, skips what is already there, and synthesises once per missing voice so `ptts` fetches
-that voice's embedding:
-
-```sh
-dev/prefetch-en-voices.sh                        # every en voice not yet cached
-dev/prefetch-en-voices.sh Alfie "Captain Silas Blackwater"   # just these
-```
+If you skip this step, `/tts` says so instead of guessing: it reports the missing snapshot, the
+path it looked under, and `just fetch-model` as the fix — and it never reaches for the network.
 
 Do this before starting zot, or restart zot afterwards: a running extension has already read its
 catalog, so voices you fetch mid-session join the picker on the next zot start.
@@ -132,7 +132,7 @@ just lint       # cargo clippy
 just run CMD="/tts hello"   # one command against the built binary
 ```
 
-`just` is a thin wrapper: every recipe is the cargo command it names, so you can run those
+`just` is a thin wrapper: every build recipe is the cargo command it names, so you can run those
 directly instead. Use the release build for live playback; the debug build generates audio slower
 than real time. If `cargo` cannot write `~/.cargo` or cannot reach crates.io, pin `CARGO_HOME` and
 `CARGO_TARGET_DIR` to directories you can write, run `cargo fetch` once with network, and build

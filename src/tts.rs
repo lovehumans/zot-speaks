@@ -42,8 +42,9 @@ pub fn load_synth(catalog: &[VoiceInfo]) -> Result<Synth, String> {
     let hub = cache::hf_hub();
     let dir = local_snapshot(&hub).ok_or_else(|| {
         format!(
-            "Phonon 31m-en snapshot not found under {}; cache it once with \
-             `./ptts --voice Miles \"warm-up\"` (or `huggingface-cli download {MODEL_REPO}`)",
+            "Phonon 31m-en snapshot not found under {}; bootstrap once: `just fetch-model` \
+             (needs the ptts CLI), or by hand `ptts --voice Miles \"warm up\"` / \
+             `huggingface-cli download {MODEL_REPO}`",
             cache::repo_dir(&hub, MODEL_REPO).display()
         )
     })?;
