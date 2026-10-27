@@ -5,7 +5,8 @@ A [zot](https://www.zot.sh) extension that speaks the last agent message aloud, 
 machine. No network access, no account, no cloud voice.
 
 [Features](#features-and-anti-features) · [Requirements](#requirements) · [Usage](#usage) ·
-[Install](#install) · [For developers](#for-developers) · [License](#license) · [Design notes](#design-notes)
+[Install](#install) · [For developers](#for-developers) · [Acknowledgements](#acknowledgements) ·
+[License](#license) · [Design notes](#design-notes)
 
 ## Features and Anti-Features
 
@@ -218,6 +219,16 @@ directly instead. Use the release build for live playback; the debug build gener
 than real time. If `cargo` cannot write `~/.cargo` or cannot reach crates.io, pin `CARGO_HOME` and
 `CARGO_TARGET_DIR` to directories you can write, run `cargo fetch` once with network, and build
 with `--offline` afterwards.
+
+## Acknowledgements
+
+- [xn-ptts](https://github.com/gradium-ai/xn-ptts) — Gradium's Phonon inference stack. This
+  extension builds against its `ptts` crate, `just bootstrap` drives its `ptts` CLI to fill the
+  model cache, and the checkpoints it serves —
+  [phonon-31m-en](https://huggingface.co/gradium/phonon-31m-en) and
+  [phonon-voices](https://huggingface.co/gradium/phonon-voices) — are theirs as well.
+- [zot](https://github.com/patriceckhart/zot) — the agent this extension speaks for, and the
+  extension protocol (`extension.json`, slash commands) it exposes.
 
 ## License
 
