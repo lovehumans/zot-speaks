@@ -202,6 +202,8 @@ catalog, so voices you fetch mid-session join the picker on the next zot start.
 
 ## For developers
 
+### Building
+
 Building, testing and running from a clone — the recipes a fork or a pull request uses, and the
 same ones CI uses: CI produces the Release binary by running `cargo build --release` on every
 version tag, so `just build` and the Release asset are the same kind of artifact.
@@ -220,7 +222,13 @@ than real time. If `cargo` cannot write `~/.cargo` or cannot reach crates.io, pi
 `CARGO_TARGET_DIR` to directories you can write, run `cargo fetch` once with network, and build
 with `--offline` afterwards.
 
+### Design notes
+
+How it works internally, the settings file and auto-speak scoping, the voice catalog and what it
+takes to build, install and test this extension: [docs/DESIGN.md](docs/DESIGN.md).
+
 ## Acknowledgements
+Thanks to: 
 
 - [xn-ptts](https://github.com/gradium-ai/xn-ptts) — Gradium's Phonon inference stack. This
   extension builds against its `ptts` crate, `just bootstrap` drives its `ptts` CLI to fill the
@@ -237,7 +245,4 @@ artifacts keep their own terms: the `ptts` crate this builds against is `MIT OR 
 Phonon model and voice embeddings you cache are upstream downloads under the terms on their Hugging
 Face pages (also `MIT OR Apache-2.0`).
 
-## Design notes
 
-How it works internally, the settings file and auto-speak scoping, the voice catalog and what it
-takes to build, install and test this extension: [docs/DESIGN.md](docs/DESIGN.md).
