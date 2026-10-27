@@ -126,12 +126,26 @@ manifest and travels with the directory.
   headroom a quiet voice needs, and the clamp keeps `100%` from clipping anything louder.
 * **Temperature** — how much random noise Phonon puts into generating the speech, `0.0`–`1.0`,
   passed per request (`SpeechOptions.temperature`). Phonon renders speech by **flow matching**:
-  the sampler integrates a latent path that starts from seeded Gaussian noise with standard
-  deviation `sqrt(temperature)`. So temperature is neither loudness nor speed — it is how far a
-  take drifts from the model's most likely delivery. `0.0` removes the noise, and the same text,
-  voice and seed then render identically every time; `0.3` (the default) is the model's own
-  prosody; above roughly `0.6` the drift becomes audible as variation and roughness rather than
-  expression. It is the knob for "say that again differently", not for "say it louder".
+  it speaks one short frame at a time, and for each frame the model starts from seeded noise and
+  shapes it into the next bit of speech. Temperature sets how strong that noise is — exactly,
+  the noise is Gaussian with standard deviation `sqrt(temperature)`. This is the upstream
+  explanation from [xn-ptts issue #254](https://github.com/gradium-ai/xn-ptts/issues/254#issuecomment-6437586855);
+  the ladder it describes, for the default model:
+  * `0` removes the noise: one fixed reading per text and voice, and the seed has no effect.
+  * Raising it lets timing, pitch and emphasis vary more, so two seeds give more different
+    takes. The upstream default is `0.3`, which we keep; from roughly `0.6` up the variation
+    becomes clearly audible.
+  * Too high and words start to slip: that begins around `2` for the default model, and by `5`
+    the speech is often garbled. Other models may differ. Negative values are rejected.
+
+  So temperature is neither loudness nor speed — it is the knob for "say that again
+  differently", not for "say it louder". The panel clamps it to `0.0`–`1.0`, which keeps the
+  settings inside the usable part of that ladder and the degradation regime out of reach.
+  Further reading named in the same reply: [How to generate text](https://huggingface.co/blog/how-to-generate)
+  (temperature on discrete next-token probabilities), [Continuous Audio Language Models](https://arxiv.org/abs/2509.06926)
+  §4.5 (defines it exactly as `sqrt(temperature)` noise for continuous audio frames), and
+  [Glow](https://arxiv.org/abs/1807.03039) §6 (an early noise-temperature flow model, but it
+  multiplies the standard deviation by `T` itself, so its numbers are not comparable to these).
 * **Favorites** — voices pinned with `f`, stored as names, listed in their own block at the top
   of the picker and marked with `★` on the Voice row.
 * **Auto speak** — speak the last agent message when the agent finishes, for the project the
