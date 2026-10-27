@@ -5,7 +5,7 @@ A [zot](https://www.zot.sh) extension that speaks the last agent message aloud, 
 machine. No network access, no account, no cloud voice.
 
 [Features](#features-and-anti-features) · [Requirements](#requirements) · [Usage](#usage) ·
-[Install](#install) · [Build](#build) · [License](#license) · [Design notes](#design-notes)
+[Install](#install) · [For developers](#for-developers) · [License](#license) · [Design notes](#design-notes)
 
 ## Features and Anti-Features
 
@@ -72,6 +72,10 @@ git clone https://github.com/lovehumans/zot-speaks
 cd zot-speaks
 just install-release                    # or pin one: just install-release v1.7.8
 ```
+
+Then run `just bootstrap` once, before your first `/tts`: `zot-speaks` only ever reads the
+Hugging Face cache, so speech stays silent — with a loud warning about the missing snapshot —
+until it is filled. See [One-time bootstrap](#one-time-bootstrap) below.
 
 Or fetch, verify and install by hand (no `just` needed):
 
@@ -195,10 +199,11 @@ path it looked under, and `just fetch-model` as the fix — and it never reaches
 Do this before starting zot, or restart zot afterwards: a running extension has already read its
 catalog, so voices you fetch mid-session join the picker on the next zot start.
 
-## Build
+## For developers
 
-This is also exactly how the release binary is produced: CI runs `cargo build --release` on
-every version tag, so `just build` and the Release asset are the same kind of artifact.
+Building, testing and running from a clone — the recipes a fork or a pull request uses, and the
+same ones CI uses: CI produces the Release binary by running `cargo build --release` on every
+version tag, so `just build` and the Release asset are the same kind of artifact.
 
 ```sh
 just build      # cargo build --release   ->  target/release/zot-speaks
