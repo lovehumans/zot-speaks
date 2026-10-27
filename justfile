@@ -70,10 +70,11 @@ install-release TAG="latest":
     zot ext install "$stage"
 
 # update an installed copy from a Release: verify first, then atomic swap; settings.json untouched.
+# The target follows zot's own lookup: $ZOT_HOME, else $XDG_STATE_HOME/zot, else ~/.local/state/zot.
 # Override INSTALLED for a project-local install: INSTALLED=<project>/.zot/extensions/zot-speaks
 update-release TAG="latest":
     @set -eu; \
-    installed="${INSTALLED:-${ZOT_HOME:-$HOME/.local/state/zot}/extensions/zot-speaks}"; \
+    installed="${INSTALLED:-${ZOT_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/zot}/extensions/zot-speaks}"; \
     test -d "$installed" || { echo "update-release: not installed: $installed"; exit 1; }; \
     url="{{RELEASE_URL}}/download/{{TAG}}"; \
     tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' INT TERM EXIT; \
@@ -117,9 +118,10 @@ install-ext: build
 
 # update an installed copy in place: swap the binary, keep settings.json where it sits.
 # (`zot ext install` refuses to overwrite, and `zot ext remove` would delete the state file.)
+# The target follows zot's own lookup: $ZOT_HOME, else $XDG_STATE_HOME/zot, else ~/.local/state/zot.
 # Override INSTALLED for a project-local install: INSTALLED=<project>/.zot/extensions/zot-speaks
 update-ext: build
-    @installed="${INSTALLED:-${ZOT_HOME:-$HOME/.local/state/zot}/extensions/zot-speaks}"; \
+    @installed="${INSTALLED:-${ZOT_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/zot}/extensions/zot-speaks}"; \
     test -d "$installed" || { echo "not installed: $installed"; exit 1; }; \
     cp {{BIN}} "$installed/zot-speaks.new"; mv -f "$installed/zot-speaks.new" "$installed/zot-speaks"; \
     echo "updated $installed (settings.json untouched)"

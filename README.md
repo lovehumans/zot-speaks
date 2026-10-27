@@ -22,7 +22,7 @@ one-shot `zot -p "…"` tears the extension down before the audio finishes.
 
 - Linux with `paplay` (PipeWire / PulseAudio).
 - CPU only — no GPU, no CUDA, no Metal. That is the point: the GPU stays free for your local LLM.
-- The model and the voices it uses must already be in your Hugging Face cache; this extension
+- [The model](https://huggingface.co/gradium/phonon-31m-en) (99 MiB) and [the voices](https://huggingface.co/gradium/phonon-voices) (9 MiB) it uses must already be in your Hugging Face cache (helper scripts provided); this extension
   reads the cache and never downloads. Cache location: `$HF_HUB_CACHE`, `$HF_HOME/hub`,
   `$XDG_CACHE_HOME/huggingface/hub`, or `$HOME/.cache/huggingface/hub`.
 - English only: `phonon-31m-en` is an English model, so only English catalog voices are offered.
@@ -57,9 +57,8 @@ the row cycles `off → here → everywhere`.
 
 Install once; zot runs it from then on. Nothing is ever downloaded at runtime.
 
-GitHub Actions compiles one binary on every
-version tag and attaches it to that tag's [Release](https://github.com/lovehumans/zot-speaks/releases)
-as `zot-speaks` (x86-64 Linux) together with a `SHA256SUMS` file; the release notes print the same
+Grab the binary from the latest [Release](https://github.com/lovehumans/zot-speaks/releases)
+named `zot-speaks` (x86-64 Linux) together with the `SHA256SUMS` file; the release notes print the same
 digest.
 
 If you have [just](https://github.com/casey/just), two recipes do exactly this — they are
@@ -98,7 +97,8 @@ Restart zot: `zot ext doctor` should list `zot-speaks` with `/tts` and `/tts-set
 `just update-release` does the download, verification and swap; by hand:
 
 ```sh
-installed="$HOME/.local/state/zot/extensions/zot-speaks"   # or <project>/.zot/extensions/…
+# zot's state dir: $ZOT_HOME, else $XDG_STATE_HOME/zot, else ~/.local/state/zot
+installed="${ZOT_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/zot}/extensions/zot-speaks"   # or <project>/.zot/extensions/…
 tmp="$(mktemp -d)"
 curl -fsSL -o "$tmp/zot-speaks" https://github.com/lovehumans/zot-speaks/releases/latest/download/zot-speaks
 curl -fsSL -o "$tmp/SHA256SUMS" https://github.com/lovehumans/zot-speaks/releases/latest/download/SHA256SUMS
@@ -145,7 +145,8 @@ just update-ext        # same directory, new binary, settings.json untouched
 Or by hand — write the new binary under a temporary name and rename it into place:
 
 ```sh
-installed="$HOME/.local/state/zot/extensions/zot-speaks"   # or <project>/.zot/extensions/…
+# zot's state dir: $ZOT_HOME, else $XDG_STATE_HOME/zot, else ~/.local/state/zot
+installed="${ZOT_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/zot}/extensions/zot-speaks"   # or <project>/.zot/extensions/…
 cp target/release/zot-speaks "$installed/zot-speaks.new"
 mv -f "$installed/zot-speaks.new" "$installed/zot-speaks"
 ```
@@ -160,7 +161,7 @@ network step, and it needs the upstream `ptts` CLI on your `PATH` — get it fro
 releases](https://github.com/gradium-ai/xn-ptts/releases).
 
 ```sh
-just bootstrap   # the model (~102 MB) plus all 37 English voices (~9 MiB), once
+just bootstrap   # the model (~99 MiB) plus all 37 English voices (~9 MiB), once
 just cache       # what the extension can see right now: snapshot, and how many voices are ready
 ```
 
@@ -172,7 +173,7 @@ whatever is already cached, so re-running it is also the coverage check: it prin
 
 You can listen to individual voices [here](https://huggingface.co/gradium/phonon-voices).
 
-If you skip this step, `/tts` says so instead of guessing: it reports the missing snapshot, the
+If you skip this step, `/tts` warns you: it reports the missing snapshot, the
 path it looked under, and `just fetch-model` as the fix — and it never reaches for the network.
 
 Do this before starting zot, or restart zot afterwards: a running extension has already read its
@@ -202,7 +203,7 @@ with `--offline` afterwards.
 MIT only — see [LICENSE](LICENSE). This covers the sources in this repository. Third-party
 artifacts keep their own terms: the `ptts` crate this builds against is `MIT OR Apache-2.0`, and the
 Phonon model and voice embeddings you cache are upstream downloads under the terms on their Hugging
-Face pages.
+Face pages (also `MIT OR Apache-2.0`).
 
 ## Design notes
 
