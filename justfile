@@ -5,6 +5,9 @@ export CARGO_TARGET_DIR := env_var_or_default('CARGO_TARGET_DIR', 'target')
 
 BIN := CARGO_TARGET_DIR + "/release/zot-speaks"
 
+# Release assets live here; override RELEASE_URL to rehearse the recipes against a mirror
+RELEASE_URL := env_var_or_default('RELEASE_URL', 'https://github.com/lovehumans/zot-speaks/releases')
+
 # list recipes
 default:
     @just --list
@@ -46,7 +49,43 @@ cache:
         echo "voices: $(find "$voices" -name '*.safetensors' | wc -l) embedding(s) cached, 37 in the English catalog"; \
     else echo "voices: no catalog cached -> run 'just bootstrap'"; fi
 
-# ---- build and install ---------------------------------------------------------------
+# ---- install from the GitHub Release (the recommended route) ---------------------------
+# GitHub Actions builds one binary per version tag and publishes it as the Release asset
+# `zot-speaks` together with `SHA256SUMS`. These recipes are the README's curl + sha256sum +
+# zot ext install, written down: no cargo, no toolchain. Run them from the clone root — the
+# clone supplies extension.json. Pin a version with TAG: just install-release TAG=v1.7.6
+
+# download the release binary, verify its digest, stage it with extension.json, install it
+install-release TAG="latest":
+    @set -eu; \
+    url="{{RELEASE_URL}}/download/{{TAG}}"; \
+    tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' INT TERM EXIT; \
+    curl -fsSL -o "$tmp/zot-speaks" "$url/zot-speaks"; \
+    curl -fsSL -o "$tmp/SHA256SUMS" "$url/SHA256SUMS"; \
+    ( cd "$tmp" && sha256sum -c SHA256SUMS ); \
+    chmod +x "$tmp/zot-speaks"; \
+    stage="$tmp/stage/zot-speaks"; mkdir -p "$stage"; \
+    cp extension.json "$stage/extension.json"; \
+    mv "$tmp/zot-speaks" "$stage/zot-speaks"; \
+    zot ext install "$stage"
+
+# update an installed copy from a Release: verify first, then atomic swap; settings.json untouched.
+# Override INSTALLED for a project-local install: INSTALLED=<project>/.zot/extensions/zot-speaks
+update-release TAG="latest":
+    @set -eu; \
+    installed="${INSTALLED:-${ZOT_HOME:-$HOME/.local/state/zot}/extensions/zot-speaks}"; \
+    test -d "$installed" || { echo "update-release: not installed: $installed"; exit 1; }; \
+    url="{{RELEASE_URL}}/download/{{TAG}}"; \
+    tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' INT TERM EXIT; \
+    curl -fsSL -o "$tmp/zot-speaks" "$url/zot-speaks"; \
+    curl -fsSL -o "$tmp/SHA256SUMS" "$url/SHA256SUMS"; \
+    ( cd "$tmp" && sha256sum -c SHA256SUMS ); \
+    cp "$tmp/zot-speaks" "$installed/zot-speaks.new"; \
+    chmod +x "$installed/zot-speaks.new"; \
+    mv -f "$installed/zot-speaks.new" "$installed/zot-speaks"; \
+    echo "updated $installed from {{TAG}} (settings.json untouched)"
+
+# ---- build and install from source -----------------------------------------------------
 
 # build the release binary
 build:

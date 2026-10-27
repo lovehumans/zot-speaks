@@ -57,10 +57,21 @@ the row cycles `off → here → everywhere`.
 
 Install once; zot runs it from then on. Nothing is ever downloaded at runtime.
 
-The repository holds sources only — no binary is committed. GitHub Actions compiles one on every
+GitHub Actions compiles one binary on every
 version tag and attaches it to that tag's [Release](https://github.com/lovehumans/zot-speaks/releases)
 as `zot-speaks` (x86-64 Linux) together with a `SHA256SUMS` file; the release notes print the same
-digest. Fetch, verify, install:
+digest.
+
+If you have [just](https://github.com/casey/just), two recipes do exactly this — they are
+plain `curl` + `sha256sum` + `zot ext install`, readable in the [justfile](justfile):
+
+```sh
+git clone https://github.com/lovehumans/zot-speaks
+cd zot-speaks
+just install-release                    # or pin one: just install-release TAG=v1.7.6
+```
+
+Or fetch, verify and install by hand:
 
 ```sh
 git clone https://github.com/lovehumans/zot-speaks
@@ -68,6 +79,7 @@ cd zot-speaks
 curl -fsSL -o zot-speaks https://github.com/lovehumans/zot-speaks/releases/latest/download/zot-speaks
 curl -fsSL -o SHA256SUMS https://github.com/lovehumans/zot-speaks/releases/latest/download/SHA256SUMS
 sha256sum -c SHA256SUMS        # must print: zot-speaks: OK
+chmod +x zot-speaks
 stage="$(mktemp -d)/zot-speaks"; mkdir -p "$stage"
 cp extension.json "$stage/"; mv zot-speaks "$stage/"
 zot ext install "$stage"
@@ -77,12 +89,13 @@ The clone supplies `extension.json` — the manifest zot needs — and the licen
 the binary. Verify before installing: `sha256sum -c` fails loudly on a truncated or tampered
 download, and you can cross-check the printed hash against the release notes. To pin a version
 instead of taking the newest, replace `latest` with the tag in both URLs:
-`releases/download/v1.7.5/…`.
+`releases/download/v1.7.7/…`.
 
 Restart zot: `zot ext doctor` should list `zot-speaks` with `/tts` and `/tts-settings` active.
 
 **Updating.** Download the new binary and swap it inside the installed directory; your settings
-(voice, favourites, per-project auto-speak) live in `settings.json` there and travel untouched:
+(voice, favourites, per-project auto-speak) live in `settings.json` there and travel untouched.
+`just update-release` does the download, verification and swap; by hand:
 
 ```sh
 installed="$HOME/.local/state/zot/extensions/zot-speaks"   # or <project>/.zot/extensions/…
@@ -90,6 +103,7 @@ tmp="$(mktemp -d)"
 curl -fsSL -o "$tmp/zot-speaks" https://github.com/lovehumans/zot-speaks/releases/latest/download/zot-speaks
 curl -fsSL -o "$tmp/SHA256SUMS" https://github.com/lovehumans/zot-speaks/releases/latest/download/SHA256SUMS
 ( cd "$tmp" && sha256sum -c SHA256SUMS )
+chmod +x "$tmp/zot-speaks"
 cp "$tmp/zot-speaks" "$installed/zot-speaks.new"
 mv -f "$installed/zot-speaks.new" "$installed/zot-speaks"   # atomic swap on one filesystem
 ```
