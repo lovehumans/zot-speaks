@@ -4,6 +4,9 @@ A [zot](https://www.zot.sh) extension that speaks the last agent message aloud, 
 [Gradium Phonon](https://huggingface.co/gradium/phonon-31m-en) text-to-speech on your own
 machine. No network access, no account, no cloud voice.
 
+[Features](#features-and-anti-features) · [Requirements](#requirements) · [Usage](#usage) ·
+[Install](#install) · [Build](#build) · [License](#license) · [Design notes](#design-notes)
+
 ## Features and Anti-Features
 
 | ✅ We do | ❌ We deliberately don't |
@@ -70,7 +73,10 @@ cd zot-speaks
 just install-release                    # or pin one: just install-release v1.7.8
 ```
 
-Or fetch, verify and install by hand:
+Or fetch, verify and install by hand (no `just` needed):
+
+<details>
+<summary>curl + sha256sum + zot ext install, step by step</summary>
 
 ```sh
 git clone https://github.com/lovehumans/zot-speaks
@@ -84,6 +90,8 @@ cp extension.json "$stage/"; mv zot-speaks "$stage/"
 zot ext install "$stage"
 ```
 
+</details>
+
 The clone supplies `extension.json` — the manifest zot needs — and the license; the release supplies
 the binary. Verify before installing: `sha256sum -c` fails loudly on a truncated or tampered
 download, and you can cross-check the printed hash against the release notes. To pin a version
@@ -94,7 +102,10 @@ Restart zot: `zot ext doctor` should list `zot-speaks` with `/tts` and `/tts-set
 
 **Updating.** Download the new binary and swap it inside the installed directory; your settings
 (voice, favourites, per-project auto-speak) live in `settings.json` there and travel untouched.
-`just update-release` does the download, verification and swap; by hand:
+`just update-release` does the download, verification and swap.
+
+<details>
+<summary>Or update by hand (no `just` needed)</summary>
 
 ```sh
 # zot's state dir: $ZOT_HOME, else $XDG_STATE_HOME/zot, else ~/.local/state/zot
@@ -108,9 +119,12 @@ cp "$tmp/zot-speaks" "$installed/zot-speaks.new"
 mv -f "$installed/zot-speaks.new" "$installed/zot-speaks"   # atomic swap on one filesystem
 ```
 
+</details>
+
 A running zot keeps the old binary open; the new one takes effect at the next zot start.
 
-### Installing by building from source
+<details>
+<summary>Installing by building from source (alternative to the Release binary)</summary>
 
 The same result, compiled on your machine instead of the Actions runner — the route to take on
 architectures other than x86-64, or whenever you prefer to build what you run:
@@ -153,6 +167,8 @@ mv -f "$installed/zot-speaks.new" "$installed/zot-speaks"
 
 `zot ext remove zot-speaks` followed by a fresh install also works, but it deletes the directory,
 `settings.json` included.
+
+</details>
 
 ### One-time bootstrap
 
