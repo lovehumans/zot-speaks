@@ -67,7 +67,7 @@ plain `curl` + `sha256sum` + `zot ext install`, readable in the [justfile](justf
 ```sh
 git clone https://github.com/lovehumans/zot-speaks
 cd zot-speaks
-just install-release                    # or pin one: just install-release TAG=v1.7.6
+just install-release                    # or pin one: just install-release v1.7.8
 ```
 
 Or fetch, verify and install by hand:
@@ -88,7 +88,7 @@ The clone supplies `extension.json` — the manifest zot needs — and the licen
 the binary. Verify before installing: `sha256sum -c` fails loudly on a truncated or tampered
 download, and you can cross-check the printed hash against the release notes. To pin a version
 instead of taking the newest, replace `latest` with the tag in both URLs:
-`releases/download/v1.7.7/…`.
+`releases/download/v1.7.8/…`.
 
 Restart zot: `zot ext doctor` should list `zot-speaks` with `/tts` and `/tts-settings` active.
 

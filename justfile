@@ -53,12 +53,12 @@ cache:
 # GitHub Actions builds one binary per version tag and publishes it as the Release asset
 # `zot-speaks` together with `SHA256SUMS`. These recipes are the README's curl + sha256sum +
 # zot ext install, written down: no cargo, no toolchain. Run them from the clone root — the
-# clone supplies extension.json. Pin a version with TAG: just install-release TAG=v1.7.6
+# clone supplies extension.json. Pin a version: just install-release v1.7.8
 
 # download the release binary, verify its digest, stage it with extension.json, install it
 install-release TAG="latest":
     @set -eu; \
-    url="{{RELEASE_URL}}/download/{{TAG}}"; \
+    if [ "{{TAG}}" = latest ]; then url="{{RELEASE_URL}}/latest/download"; else url="{{RELEASE_URL}}/download/{{TAG}}"; fi; \
     tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' INT TERM EXIT; \
     curl -fsSL -o "$tmp/zot-speaks" "$url/zot-speaks"; \
     curl -fsSL -o "$tmp/SHA256SUMS" "$url/SHA256SUMS"; \
@@ -76,7 +76,7 @@ update-release TAG="latest":
     @set -eu; \
     installed="${INSTALLED:-${ZOT_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/zot}/extensions/zot-speaks}"; \
     test -d "$installed" || { echo "update-release: not installed: $installed"; exit 1; }; \
-    url="{{RELEASE_URL}}/download/{{TAG}}"; \
+    if [ "{{TAG}}" = latest ]; then url="{{RELEASE_URL}}/latest/download"; else url="{{RELEASE_URL}}/download/{{TAG}}"; fi; \
     tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' INT TERM EXIT; \
     curl -fsSL -o "$tmp/zot-speaks" "$url/zot-speaks"; \
     curl -fsSL -o "$tmp/SHA256SUMS" "$url/SHA256SUMS"; \
