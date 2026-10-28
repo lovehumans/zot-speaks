@@ -19,12 +19,20 @@ machine. No network access, no account, no cloud voice.
 | ✅ Auto-speak of the final answer, scoped per project | |
 
 Phonon is a 31 M-parameter model: natural speech with imperfect prosody, not a commercial studio
-voice. Output is mono 24 kHz through `paplay`. Speaking needs a live interactive session — a
-one-shot `zot -p "…"` tears the extension down before the audio finishes.
+voice. Output is mono 24 kHz, piped to a player that reads raw PCM from a pipe: `ffplay` (from
+ffmpeg) by default, or `paplay` where ffmpeg is not installed. Speaking needs a live interactive
+session — a one-shot `zot -p "…"` tears the extension down before the audio finishes.
 
 ## Requirements
 
-- Linux with `paplay` (PipeWire / PulseAudio).
+- `ffmpeg` (which provides `ffplay`, the default player on Linux and macOS) or `paplay` (PipeWire /
+  PulseAudio). No other audio setup is needed: the extension pipes raw PCM to the first player it
+  finds — `ffplay`, then `paplay` — and says so when neither is there.
+- macOS is source-build only — there is no macOS Release binary. You need a Rust toolchain and
+  [just](https://github.com/casey/just); see [Install](#install) and [docs/MACOS.md](docs/MACOS.md).
+- `ZOT_SPEAKS_SINK=paplay|ffplay` pins one player when more than one is installed — for instance
+  `ZOT_SPEAKS_SINK=paplay` on a PipeWire box; empty or unset picks automatically, and a name that
+  is not a player is reported rather than ignored.
 - CPU only — no GPU, no CUDA, no Metal. That is the point: the GPU stays free for your local LLM.
 - [The model](https://huggingface.co/gradium/phonon-31m-en) (99 MiB) and [the voices](https://huggingface.co/gradium/phonon-voices) (9 MiB) it uses must already be in your Hugging Face cache (helper scripts provided); this extension
   reads the cache and never downloads. Cache location: `$HF_HUB_CACHE`, `$HF_HOME/hub`,
@@ -63,7 +71,7 @@ Install once; zot runs it from then on. Nothing is ever downloaded at runtime.
 
 Grab the binary from the latest [Release](https://github.com/lovehumans/zot-speaks/releases)
 named `zot-speaks` (x86-64 Linux) together with the `SHA256SUMS` file; the release notes print the same
-digest.
+digest. On macOS there is no Release binary to grab: build from source, below.
 
 If you have [just](https://github.com/casey/just), two recipes do exactly this — they are
 plain `curl` + `sha256sum` + `zot ext install`, readable in the [justfile](justfile):
@@ -105,9 +113,13 @@ instead of taking the newest, replace `latest` with the tag in both URLs:
 
 Restart zot: `zot ext doctor` should list `zot-speaks` with `/tts` and `/tts-settings` active.
 
-**Updating.** Download the new binary and swap it inside the installed directory; your settings
-(voice, favourites, per-project auto-speak) live in `settings.json` there and travel untouched.
-`just update-release` does the download, verification and swap.
+**Updating.** Swap the new files inside the installed directory; your settings (voice, favourites,
+per-project auto-speak) live in `settings.json` there and travel untouched. `just update-release`
+downloads the binary **and the `extension.json` manifest** the Release publishes, verifies both
+against its `SHA256SUMS`, and swaps them; `just update-ext` does the same from a source build. The
+manifest matters because zot reads it at load: `zot ext list` reports the version *it* says, so a
+swap that carries only the binary leaves an installation advertising a version it does not run.
+Releases before v1.7.15 publish the binary alone, and then the recipe says so instead of pretending.
 
 <details>
 <summary>Or update by hand (no `just` needed)</summary>
@@ -116,12 +128,15 @@ Restart zot: `zot ext doctor` should list `zot-speaks` with `/tts` and `/tts-set
 # zot's state dir: $ZOT_HOME, else $XDG_STATE_HOME/zot, else ~/.local/state/zot
 installed="${ZOT_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/zot}/extensions/zot-speaks"   # or <project>/.zot/extensions/…
 tmp="$(mktemp -d)"
-curl -fsSL -o "$tmp/zot-speaks" https://github.com/lovehumans/zot-speaks/releases/latest/download/zot-speaks
-curl -fsSL -o "$tmp/SHA256SUMS" https://github.com/lovehumans/zot-speaks/releases/latest/download/SHA256SUMS
+base=https://github.com/lovehumans/zot-speaks/releases/latest/download
+curl -fsSL -o "$tmp/zot-speaks" "$base/zot-speaks"
+curl -fsSL -o "$tmp/extension.json" "$base/extension.json"
+curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS"
 ( cd "$tmp" && sha256sum -c SHA256SUMS )
 chmod +x "$tmp/zot-speaks"
 cp "$tmp/zot-speaks" "$installed/zot-speaks.new"
 mv -f "$installed/zot-speaks.new" "$installed/zot-speaks"   # atomic swap on one filesystem
+cp "$tmp/extension.json" "$installed/extension.json"        # the version zot reports
 ```
 
 </details>
@@ -132,7 +147,9 @@ A running zot keeps the old binary open; the new one takes effect at the next zo
 <summary>Installing by building from source (alternative to the Release binary)</summary>
 
 The same result, compiled on your machine instead of the Actions runner — the route to take on
-architectures other than x86-64, or whenever you prefer to build what you run:
+architectures other than x86-64, **the route on macOS**, and whenever you prefer to build what you
+run. On macOS, install the player first: `brew install ffmpeg`; [docs/MACOS.md](docs/MACOS.md)
+lists what to expect there and what still needs a Mac to confirm.
 
 ```sh
 git clone https://github.com/lovehumans/zot-speaks

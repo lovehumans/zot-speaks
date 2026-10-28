@@ -65,15 +65,24 @@ echo "voice embeddings live in: $VOICES_DIR"
 # Build aligned id/name arrays for the target language only. voice_id has no spaces and is the
 # safest thing to hand to `--voice`; names often contain spaces, so we resolve them by exact
 # string match within this language (a foreign voice name is therefore never matched here).
+# Aligned arrays only, no associative array: the bash that macOS ships (3.2) has no `declare -A`.
 declare -a LANG_IDS LANG_NAMES
-declare -A ID2NAME
 while IFS= read -r line; do
     id="$(sed -E 's/.*"voice_id"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' <<<"$line")"
     nm="$(sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' <<<"$line")"
     [ -n "$id" ] && [ "$id" != "$line" ] || continue
-    LANG_IDS+=("$id"); LANG_NAMES+=("$nm"); ID2NAME["$id"]="$nm"
+    LANG_IDS+=("$id"); LANG_NAMES+=("$nm")
 done < <(grep -E "\"language\"[[:space:]]*:[[:space:]]*\"$VOICE_LANG\"" "$CATALOG")
 [ "${#LANG_IDS[@]}" -gt 0 ] || die "no '$VOICE_LANG' voices in the catalog."
+
+# The two arrays are aligned by construction, so a name is a lookup in them (37 voices: cheap).
+name_of() {
+    local i
+    for i in "${!LANG_IDS[@]}"; do
+        [ "${LANG_IDS[$i]}" = "$1" ] && { echo "${LANG_NAMES[$i]}"; return; }
+    done
+    echo "$1"   # an id is a perfectly good name for a voice nobody named
+}
 
 EN_IDS=("${LANG_IDS[@]}")
 
@@ -102,7 +111,7 @@ for id in "${EN_IDS[@]}"; do
         skipped=$((skipped + 1))
         continue
     fi
-    name="${ID2NAME[$id]}"
+    name="$(name_of "$id")"
     echo "  + fetching voice '$name' ($id)"
     cmd=("$PTTS" --voice "$id" --lang "$VOICE_LANG" --temperature 0.1 -o "$OUT" "hello")
     [ -n "$MODEL" ] && cmd+=(--model "$MODEL")

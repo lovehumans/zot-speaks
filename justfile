@@ -54,6 +54,8 @@ cache:
 # `zot-speaks` together with `SHA256SUMS`. These recipes are the README's curl + sha256sum +
 # zot ext install, written down: no cargo, no toolchain. Run them from the clone root — the
 # clone supplies extension.json. Pin a version: just install-release v1.7.8
+# Linux x86-64 only: it is the one platform a Release binary is shipped for. On macOS build from
+# source with `install-ext` below, after `brew install ffmpeg`.
 
 # download the release binary, verify its digest, stage it with extension.json, install it
 install-release TAG="latest":
@@ -69,7 +71,9 @@ install-release TAG="latest":
     mv "$tmp/zot-speaks" "$stage/zot-speaks"; \
     zot ext install "$stage"
 
-# update an installed copy from a Release: verify first, then atomic swap; settings.json untouched.
+# update an installed copy from a Release: fetch the binary and the manifest that Release publishes,
+# verify both against its SHA256SUMS, then swap in place; settings.json untouched. Releases from
+# v1.7.15 carry extension.json; older ones carry only the binary, and then this says so.
 # The target follows zot's own lookup: $ZOT_HOME, else $XDG_STATE_HOME/zot, else ~/.local/state/zot.
 # Override INSTALLED for a project-local install: INSTALLED=<project>/.zot/extensions/zot-speaks
 update-release TAG="latest":
@@ -80,13 +84,22 @@ update-release TAG="latest":
     tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' INT TERM EXIT; \
     curl -fsSL -o "$tmp/zot-speaks" "$url/zot-speaks"; \
     curl -fsSL -o "$tmp/SHA256SUMS" "$url/SHA256SUMS"; \
+    manifest=no; \
+    if curl -fsSL -o "$tmp/extension.json" "$url/extension.json" 2>/dev/null; then manifest=yes; fi; \
     ( cd "$tmp" && sha256sum -c SHA256SUMS ); \
     cp "$tmp/zot-speaks" "$installed/zot-speaks.new"; \
     chmod +x "$installed/zot-speaks.new"; \
     mv -f "$installed/zot-speaks.new" "$installed/zot-speaks"; \
-    echo "updated $installed from {{TAG}} (settings.json untouched)"
+    if [ "$manifest" = yes ]; then \
+      cp "$tmp/extension.json" "$installed/extension.json"; \
+      echo "updated $installed from {{TAG}} (binary + extension.json, settings.json untouched)"; \
+    else \
+      echo "updated $installed from {{TAG}} (binary only: this Release publishes no extension.json, so zot still reports the version the installed manifest claims)"; \
+    fi
 
 # ---- build and install from source -----------------------------------------------------
+# The route on macOS: `brew install ffmpeg` for the `ffplay` player, a Rust toolchain, then
+# `just install-ext`. Nothing else in this justfile installs anything on a Mac.
 
 # build the release binary
 build:
@@ -116,12 +129,15 @@ install-ext: build
     cp {{BIN}} "$stage/zot-speaks/zot-speaks"; \
     zot ext install "$stage/zot-speaks"
 
-# update an installed copy in place: swap the binary, keep settings.json where it sits.
+# update an installed copy in place: swap binary and manifest, keep settings.json where it sits.
 # (`zot ext install` refuses to overwrite, and `zot ext remove` would delete the state file.)
+# The manifest travels with the binary on purpose: `zot ext list` reports the manifest's version, so
+# a stale one would advertise a version the binary does not have, and never carry a new command.
 # The target follows zot's own lookup: $ZOT_HOME, else $XDG_STATE_HOME/zot, else ~/.local/state/zot.
 # Override INSTALLED for a project-local install: INSTALLED=<project>/.zot/extensions/zot-speaks
 update-ext: build
     @installed="${INSTALLED:-${ZOT_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/zot}/extensions/zot-speaks}"; \
     test -d "$installed" || { echo "not installed: $installed"; exit 1; }; \
     cp {{BIN}} "$installed/zot-speaks.new"; mv -f "$installed/zot-speaks.new" "$installed/zot-speaks"; \
-    echo "updated $installed (settings.json untouched)"
+    cp extension.json "$installed/extension.json"; \
+    echo "updated $installed from source $(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^\"]*\)".*/v\1/p' extension.json | head -1) (settings.json untouched)"

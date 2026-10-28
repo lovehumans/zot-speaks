@@ -15,13 +15,14 @@
 //!   queued requests are coalesced, so held keys audition only where the cursor lands
 //!   shutdown -> stop, shutdown_ack, exit
 //!
-//! Playback design (unchanged from the validated slice):
+//! Playback design (one contract, one code path):
 //!   * `stream_with` yields mono f32 PCM chunks, so time-to-first-audio is decoupled from length.
 //!   * Each chunk is scaled by the volume dial (`Settings::gain`), converted to s16le, and piped to
-//!     a `paplay` sink.
+//!     the first player on the chain that is installed: `ffplay`, then `paplay` (ADR 2026-10-28).
+//!     Both read raw s16le mono on stdin, so nothing downstream knows or cares which one it got.
 //!   * Voice and temperature go through `SpeechOptions`, resolved against the locally-registered
-//!     voice catalog. Stop is cooperative: we drop the `SpeechStream` and close `paplay`'s stdin.
-//!   * Writes are paced to real time so `paplay` never buffers far ahead — low TTFB, short stop tail.
+//!     voice catalog. Stop is cooperative: we drop the `SpeechStream` and close the sink's stdin.
+//!   * Writes are paced to real time so the player never buffers far ahead — low TTFB, short tail.
 
 mod cache;
 mod panel;
@@ -31,9 +32,9 @@ mod voices;
 mod wire;
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -56,6 +57,16 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// How far ahead of real-time playback we run: small enough that a stop goes quiet within a
 /// chunk, large enough that `paplay` never starves.
 const PLAY_LEAD: Duration = Duration::from_millis(40);
+
+/// `ZOT_SPEAKS_SINK=paplay|ffplay` pins one player; unset or empty means "pick for me". It is how
+/// the wire tests exercise a player the machine running them does not have.
+const SINK_ENV: &str = "ZOT_SPEAKS_SINK";
+
+/// How long a sink cut short may keep draining before we kill it. `paplay` sees EOF and exits
+/// within a tick; `ffplay` is the player that sits on an SDL audio buffer, so this is what bounds
+/// the tail of a stopped utterance.
+const STOP_GRACE: Duration = Duration::from_millis(150);
+const STOP_GRACE_TICK: Duration = Duration::from_millis(10);
 
 enum Cmd {
     Play { text: String, settings: Settings },
@@ -338,7 +349,7 @@ fn main() {
 
 fn join_player(player: &mut Option<JoinHandle<()>>) {
     if let Some(handle) = player.take() {
-        // The playback thread reaps its `paplay` child before returning, so joining here
+        // The playback thread reaps its sink child before returning, so joining here
         // guarantees no orphaned sink process on exit.
         let _ = handle.join();
     }
@@ -532,6 +543,108 @@ fn latest_of(rx: &Receiver<Cmd>, text: String, settings: Settings) -> Resume {
     }
 }
 
+/// The players we know how to pipe raw PCM to, tried in this order unless `ZOT_SPEAKS_SINK` pins
+/// one. `ffplay` (ffmpeg) is the default on every platform: it is the one player Linux and macOS
+/// both have, and it always eats raw PCM from a pipe. `paplay` is the native PipeWire/PulseAudio
+/// player, kept as the fallback for a box without ffmpeg and available as the explicit pin
+/// `ZOT_SPEAKS_SINK=paplay` (ADR 2026-10-28, flipping the 10-27 order). `afplay` is deliberately
+/// absent: it wants a file, so using it would mean buffering the whole utterance first.
+const PLAYERS: [&str; 2] = ["ffplay", "paplay"];
+
+/// The chain for one utterance. A pin that names nothing known selects nothing at all, so a typo
+/// in `ZOT_SPEAKS_SINK` reports itself instead of quietly playing through a player the user asked
+/// us not to use.
+fn player_chain(pin: Option<&str>) -> Vec<&'static str> {
+    PLAYERS
+        .into_iter()
+        .filter(|&player| pin.is_none_or(|wanted| wanted == player))
+        .collect()
+}
+
+/// How each player is told the format: mono s16le on stdin at this rate. Everything after the
+/// spawn is shared, because the format is the whole contract.
+fn player_args(player: &str, rate: u32) -> Vec<String> {
+    let rate = rate.to_string();
+    match player {
+        "paplay" => vec![
+            "--raw".into(),
+            "--format=s16le".into(),
+            "--channels=1".into(),
+            "--rate".into(),
+            rate,
+        ],
+        _ => vec![
+            "-nodisp".into(),
+            "-autoexit".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-f".into(),
+            "s16le".into(),
+            "-ar".into(),
+            rate,
+            "-ch_layout".into(), // not `-ac 1`: removed in newer ffmpeg
+            "mono".into(),
+            "-".into(),
+        ],
+    }
+}
+
+/// Why nothing could be started — the three shapes are different problems and must not share one
+/// sentence: a pin that names a player we do not know, a pin that names one we do know but that is
+/// not on this machine (`ZOT_SPEAKS_SINK=paplay` on a Mac is the obvious one), and no player at all.
+/// Pure, so the wording is testable without a subprocess.
+fn no_player_hint(pin: Option<&str>) -> String {
+    match pin {
+        Some(pinned) if !PLAYERS.contains(&pinned) => format!(
+            "{SINK_ENV}='{pinned}' is not a player zot-speaks knows ({})",
+            PLAYERS.join(", ")
+        ),
+        Some(pinned) => format!(
+            "{SINK_ENV}='{pinned}' is known but not installed; install it, or unset {SINK_ENV} to let zot-speaks choose ({})",
+            PLAYERS.join(", ")
+        ),
+        None if cfg!(target_os = "macos") => {
+            "no audio player found: brew install ffmpeg, or set ZOT_SPEAKS_SINK".to_string()
+        }
+        None => {
+            "no audio player found: install ffmpeg or paplay, or set ZOT_SPEAKS_SINK".to_string()
+        }
+    }
+}
+
+/// Nothing we could start: report the reason. No fallback is attempted — a pin is what the user
+/// asked for, and a missing player is reported rather than replaced by something they excluded.
+fn no_player(out: &Out, pin: Option<&str>) {
+    out.notify("error", &format!("zot-speaks: {}", no_player_hint(pin)));
+}
+
+/// A player that gave up on its own says why on stderr, and forwarding that is the difference
+/// between "PulseAudio is down" and a `/tts` that looked like it worked. Both players write little
+/// (`-loglevel error`), so reading after stdin closed cannot block on a full pipe.
+fn report_player_error(out: &Out, child: &mut Child, player: &str) {
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    let reason = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("nothing on stderr");
+    // Installed-but-broken (`paplay` with no sound server) is not the same as absent, so name the
+    // other player the user can pin: a dead PulseAudio should not read as a dead /tts.
+    let alternative = PLAYERS
+        .iter()
+        .copied()
+        .find(|&other| other != player)
+        .map(|other| format!("; or try {SINK_ENV}={other}"))
+        .unwrap_or_default();
+    out.notify(
+        "error",
+        &format!("zot-speaks: {player} stopped: {reason}{alternative}"),
+    );
+}
+
 /// Synthesize + stream one text under the given settings, watching for a cooperative Stop or a
 /// superseding Play between PCM chunks. Returns what the caller should do next.
 fn play_one(
@@ -552,16 +665,6 @@ fn play_one(
             ),
         );
     }
-    out.notify(
-        "info",
-        &format!(
-            "zot-speaks: speaking as {} at temp {:.2}, vol {:.0}%",
-            used_voice.clone().unwrap_or_else(|| "default".to_string()),
-            options.temperature.unwrap_or(0.0),
-            settings.volume * 100.0,
-        ),
-    );
-
     let mut stream = match synth.stream_with(text, &options) {
         Ok(stream) => stream,
         Err(e) => {
@@ -570,43 +673,53 @@ fn play_one(
         }
     };
     let rate = stream.sample_rate();
-
-    let rate_arg = rate.to_string();
-    let mut child = match Command::new("paplay")
-        .args([
-            "--raw",
-            "--format=s16le",
-            "--channels=1",
-            "--rate",
-            &rate_arg,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            out.notify(
-                "error",
-                &format!("zot-speaks: failed to start `paplay`: {e}"),
-            );
-            return Resume::Idle;
-        }
+    // Start the first player on the chain that is installed; from here on nothing knows or cares
+    // which one it is, because they all eat the same PCM on stdin. A player that starts and then
+    // dies is not a spawn failure — it is reported where it actually shows up, at the teardown.
+    let pin = std::env::var(SINK_ENV).ok().filter(|name| !name.is_empty());
+    let Some((player, mut child)) = player_chain(pin.as_deref()).iter().find_map(|&player| {
+        Command::new(player)
+            .args(player_args(player, rate))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .ok()
+            .map(|child| (player, child))
+    }) else {
+        no_player(out, pin.as_deref());
+        return Resume::Idle;
     };
     let mut sink = match child.stdin.take() {
         Some(sink) => sink,
         None => {
-            out.notify("error", "zot-speaks: paplay stdin unavailable");
+            // Cannot happen with `Stdio::piped()`. If it ever does, do not leave the child behind.
+            let _ = child.kill();
+            let _ = child.wait();
+            out.notify("error", &format!("zot-speaks: no stdin for {player}"));
             return Resume::Idle;
         }
     };
+
+    // Named only now that a player is actually running: the user hears which one they are hearing,
+    // and a request that could not be played is not announced as if it were.
+    out.notify(
+        "info",
+        &format!(
+            "zot-speaks: speaking as {} at temp {:.2}, vol {:.0}% through {player}",
+            used_voice.clone().unwrap_or_else(|| "default".to_string()),
+            options.temperature.unwrap_or(0.0),
+            settings.volume * 100.0,
+        ),
+    );
 
     let gain = settings.gain();
     playing.store(true, Ordering::SeqCst);
     let started = Instant::now();
     let mut samples_written: u64 = 0;
     let mut resume = Resume::Idle;
+    // Audio the user has moved on from: drives the bounded drain at the teardown below.
+    let mut cut_short = false;
     let mut buffer: Vec<u8> = Vec::new();
 
     for chunk in stream.by_ref() {
@@ -646,10 +759,12 @@ fn play_one(
         match rx.try_recv() {
             Ok(Cmd::Stop) => {
                 resume = Resume::Idle;
+                cut_short = true;
                 break;
             }
             Ok(Cmd::Play { text, settings }) => {
                 resume = Resume::Play { text, settings };
+                cut_short = true;
                 break;
             }
             Ok(Cmd::Exit) => {
@@ -666,8 +781,24 @@ fn play_one(
 
     playing.store(false, Ordering::SeqCst);
     drop(stream); // SpeechStream::drop halts generation workers.
-    drop(sink); // close paplay stdin: EOF -> paplay drains its buffer and exits.
-    let _ = child.wait(); // reap the sink; no signals sent anywhere.
+                  // Cooperative stop: closing our stdin is EOF for the player. An utterance that ran to its end
+                  // gets to drain whatever the player still holds. One that was cut short is audio nobody wants
+                  // any more, so it gets a bounded grace — `paplay` sees EOF and exits within a tick, `ffplay` is
+                  // the one that sits on an SDL buffer — and is then killed rather than orphaned.
+    drop(sink);
+    let mut killed = false;
+    if cut_short {
+        let deadline = Instant::now() + STOP_GRACE;
+        while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+            thread::sleep(STOP_GRACE_TICK);
+        }
+        killed = true;
+        let _ = child.kill();
+    }
+    // A player that gave up on its own has something to say; one we killed on purpose does not.
+    if !killed && matches!(child.wait(), Ok(status) if !status.success()) {
+        report_player_error(out, &mut child, player);
+    }
     resume
 }
 
@@ -687,7 +818,7 @@ fn apply_ptts_env() {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_final_stop, Messages};
+    use super::{is_final_stop, no_player_hint, player_args, player_chain, Messages};
 
     /// Auto-speak hangs on this gate, so it is worth naming the values out loud. The host's own
     /// name for a finished answer (`end`, what zot puts on the wire) and the provider's name the
@@ -733,5 +864,58 @@ mod tests {
             "a slot holds its latest message"
         );
         assert_eq!(m.newest, "third", "/tts reads what was last written");
+    }
+
+    /// Every player is tried in order unless `ZOT_SPEAKS_SINK` pins one, and an unknown name pins
+    /// nothing at all — a typo must not quietly fall back to a player the user excluded.
+    #[test]
+    fn a_pinned_sink_selects_one_and_an_unknown_name_selects_none() {
+        assert_eq!(player_chain(None), vec!["ffplay", "paplay"]);
+        assert_eq!(player_chain(Some("ffplay")), vec!["ffplay"]);
+        assert_eq!(player_chain(Some("paplay")), vec!["paplay"]);
+        assert!(player_chain(Some("mpv")).is_empty());
+    }
+
+    /// The three ways a speak can have no player are three different diagnoses. A typo in the pin,
+    /// a pin naming a real player this machine does not have (`paplay` on macOS), and no player at
+    /// all must not collapse into one sentence that is wrong for two of them.
+    #[test]
+    fn a_missing_player_names_itself_more_precisely_than_a_bad_pin() {
+        let bad_pin = no_player_hint(Some("mpv"));
+        assert!(bad_pin.contains("mpv"));
+        assert!(bad_pin.contains("not a player zot-speaks knows"));
+        let absent_pin = no_player_hint(Some("paplay"));
+        assert!(absent_pin.contains("paplay"));
+        assert!(absent_pin.contains("known but not installed"));
+        assert!(!absent_pin.contains("not a player zot-speaks knows"));
+        let nothing = no_player_hint(None);
+        assert!(nothing.contains("no audio player found"));
+        assert!(nothing.contains("ZOT_SPEAKS_SINK"));
+    }
+
+    /// The whole point of the chain is that every player eats the same PCM, so one write loop and
+    /// one stop rule serve them all (ADR 2026-10-27).
+    #[test]
+    fn every_player_is_told_the_exact_pcm_contract() {
+        assert_eq!(
+            player_args("paplay", 24000),
+            ["--raw", "--format=s16le", "--channels=1", "--rate", "24000"]
+        );
+        assert_eq!(
+            player_args("ffplay", 22050),
+            [
+                "-nodisp",
+                "-autoexit",
+                "-loglevel",
+                "error",
+                "-f",
+                "s16le",
+                "-ar",
+                "22050",
+                "-ch_layout",
+                "mono",
+                "-",
+            ]
+        );
     }
 }

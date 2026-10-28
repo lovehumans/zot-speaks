@@ -19,13 +19,17 @@ fn snapshot() -> Option<String> {
     // HF_HOME/hub, XDG_CACHE_HOME/huggingface/hub, ~/.cache/huggingface/hub.
     let home = std::env::var("HOME").unwrap_or_default();
     let roots = [
-        std::env::var("HF_HUB_CACHE").ok().map(std::path::PathBuf::from),
+        std::env::var("HF_HUB_CACHE")
+            .ok()
+            .map(std::path::PathBuf::from),
         std::env::var("HF_HOME")
             .ok()
             .map(|dir| std::path::PathBuf::from(dir).join("hub")),
-        std::env::var("XDG_CACHE_HOME")
-            .ok()
-            .map(|dir| std::path::PathBuf::from(dir).join("huggingface").join("hub")),
+        std::env::var("XDG_CACHE_HOME").ok().map(|dir| {
+            std::path::PathBuf::from(dir)
+                .join("huggingface")
+                .join("hub")
+        }),
         Some(
             std::path::PathBuf::from(home)
                 .join(".cache")

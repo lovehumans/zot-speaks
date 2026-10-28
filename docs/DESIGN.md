@@ -11,10 +11,24 @@ extension does and how to run it, see [../README.md](../README.md).
 * Inference: `gradium/phonon-31m-en`, `Quant::F32`, `DeviceKind::Cpu`, loaded once on a
   background thread; `stream_with` yields mono float PCM chunks so time-to-first-audio is
   independent of utterance length.
-* Audio: each chunk is scaled by `Settings::gain` (twice the volume dial) and piped to
-  `paplay --raw --format=s16le --channels=1 --rate 24000`, paced to real time.
-* Stop is cooperative: the `SpeechStream` is dropped and `paplay`'s stdin is closed (EOF),
-  so generation and playback halt without signals.
+* Audio: each chunk is scaled by `Settings::gain` (twice the volume dial), converted to mono s16le,
+  and written to the stdin of the first player that is installed — `ffplay` before `paplay`:
+  `ffplay -nodisp -autoexit -loglevel error -f s16le -ar 24000 -ch_layout mono -`, or
+  `paplay --raw --format=s16le --channels=1 --rate 24000`. They are
+  interchangeable because the contract is the same — raw s16le mono at the rate named — so there is
+  one write loop, one pacing rule and one stop rule. `ffplay` is the default because it is the one
+  player both Linux and macOS have; `paplay` is the fallback where ffmpeg is absent and the pin
+  `ZOT_SPEAKS_SINK=paplay` for a PipeWire/PulseAudio box that wants its native player
+  (ADR 2026-10-28, flipping the 10-27 order).
+  `afplay` is not a candidate: it reads files, not a pipe, so using it would mean synthesizing the
+  whole utterance before hearing any of it.
+* Writes are paced to real time with a 40 ms lead, which is what keeps time-to-first-sound low and
+  the player's buffer small.
+* Stop is cooperative: the `SpeechStream` is dropped and the player's stdin is closed (EOF). An
+  utterance that ran to its end gets to drain whatever the player holds; one that was cut short gets
+  a 150 ms grace and is then killed rather than left orphaned, because `paplay` exits on EOF at once
+  while `ffplay` sits on an SDL audio buffer. A player that gives up on its own has its stderr
+  reported as a notification; one killed on purpose does not.
 
 ## The settings panel
 
@@ -320,4 +334,8 @@ crate cache, not a source problem.
   when zot is run one-shot (`zot -p "…"`, or a prompt on a pipe), so there is no time left to
   synthesize and play before the host tears the extension down; auto speak is an interactive-session
   feature. `/tts` in a one-shot run is cut off the same way.
-* Mono, 24 kHz output through `paplay`; CPU inference only.
+* Mono, 24 kHz output, piped to `ffplay` by default and to `paplay` where ffmpeg is absent (or when
+  `ZOT_SPEAKS_SINK=paplay` pins it); CPU inference only.
+* **macOS playback has not been heard on a Mac by this project's CI.** The `ffplay` path is real and
+  its contract is tested against a stand-in player, but first sound, stop tail and any SDL behaviour
+  on macOS are a human check on real hardware.

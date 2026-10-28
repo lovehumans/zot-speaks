@@ -55,22 +55,25 @@ jobs:
       run: |
         tag=$(git tag --points-at HEAD | grep '^v' | sort -V | tail -n1 || true)
         echo "tag=$tag" >> "$GITHUB_OUTPUT"
-    - name: Package the release binary
+    # The manifest travels as an asset next to the binary, and both are checksummed by the same
+    # SHA256SUMS. zot reads extension.json at load (name, exec, commands, version), so an update
+    # that swaps only the binary leaves an installation announcing a version it does not run; a
+    # Release-based update can only carry the manifest if the Release publishes it.
+    - name: Package the release binary and its manifest
       if: steps.tag.outputs.tag != ''
       run: |
         install -m 0755 target/release/zot-speaks zot-speaks
-        sha256sum zot-speaks > SHA256SUMS
-    - name: Attach it to the tag's release
+        sha256sum zot-speaks extension.json > SHA256SUMS
+    - name: Attach them to the tag's release
       if: steps.tag.outputs.tag != ''
       run: |
         tag="${{ steps.tag.outputs.tag }}"
-        sha=$(cut -d' ' -f1 SHA256SUMS)
-        printf 'Built with cargo build --release on ubuntu-latest by GitHub Actions.\n\nsha256: %s\n' "$sha" > NOTES
+        printf 'Built with cargo build --release on ubuntu-latest by GitHub Actions.\n\n%s\n' "$(cat SHA256SUMS)" > NOTES
         if gh release view "$tag" >/dev/null 2>&1; then
           echo "release $tag already exists; refreshing its assets instead of failing"
         else
           gh release create "$tag" --title "zot-speaks $tag" --notes-file NOTES
         fi
-        gh release upload "$tag" zot-speaks SHA256SUMS --clobber
+        gh release upload "$tag" zot-speaks extension.json SHA256SUMS --clobber
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
