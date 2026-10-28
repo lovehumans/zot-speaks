@@ -45,11 +45,22 @@ extension does and how to run it, see [../README.md](../README.md).
 
 Keys: `up`/`down` move the cursor · `left`/`right` (or `-`/`+`) adjust the focused row — a
 **Volume or Speed change then says the selected voice out loud at the new level or rate**, so a
-level and a rate are something you hear rather than a number you read, and on **Auto speak** they
-step that row around its three values (`off` → `on · here` → `on · everywhere`) · `enter` on the
+level and a rate are something you hear rather than a number you read, and on **Temperature** they
+start that row explaining itself out loud, repeating while it stays selected (see *The Temperature
+row explains itself*) · on **Auto speak** they step that row around its three values (`off` →
+`on · here` → `on · everywhere`) · `enter` on the
 **Voice** row opens the picker · `s` speaks the last agent message in the selected voice · `esc`
 closes the panel (or returns from the picker). A pinned voice is marked on the Voice row
 (`Everly ★`).
+
+Those keys are the panel's footer. Its last row belongs to the body and names what is running:
+`zot-speaks v<version>`, taken from the build itself and right-aligned, so it reads as a caption and
+not as a sixth setting. Installing an update is the main way this extension changes under someone, and
+the panel is where you find out whether it landed. Like the body, every footer row stays within 70
+columns, so moving the cursor never changes the panel's height; the caption is padded to exactly that
+width, so it never wraps either. It sits in the body rather than in the footer because a footer is one
+string: zot prints a newline inside it while still counting it as a single row, so each repaint left a
+row of the previous frame standing under the panel.
 
 Voice picker — every **English** catalog voice in three blocks separated by a blank line (pinned
 favorites, ready voices, not-yet-downloaded voices), in two columns:
@@ -113,9 +124,32 @@ Hello, my name is Juniper. Warm, expressive voice with a bright, agile delivery�
 * `f` re-auditions the voice it just pinned — hearing it is how you know the pin landed.
 * On the main view a **Volume** or **Speed** change is followed by the selected voice saying its own
   name at the new level or rate: the same short line at 40% and at 90%, at 0.8x and at 1.4x, is a
-  faster way to choose than reading a number. Temperature changes stay silent, because temperature
-  is neither a level nor a rate — it changes *which* take you get, and a name-only line cannot show
-  that.
+  faster way to choose than reading a number. Temperature gets no such audition, because it is
+  neither a level nor a rate — it changes *which* take you get, and a name-only line cannot show
+  that. It is spoken about instead, out loud.
+
+### The Temperature row explains itself
+
+Temperature is the one setting a number on a row cannot explain, so while the **Temperature** row
+holds the cursor the panel keeps saying what it does, in the voice you selected:
+
+```
+Temperature adds variety to how a sentence is pronounced.
+```
+
+* It starts when the cursor arrives on the row, and it goes on repeating. What bounds it is the row
+  being selected, not a number of repetitions.
+* An arrow on the value does not restart the sentence already running. The **next** repetition is
+  synthesized at the value you just stepped — which is the point: the same sentence heard at `0.30`
+  and then at `0.70` is the demonstration as well as the explanation.
+* It ends when the cursor leaves the row, when the panel closes, when `/tts stop` is asked for, or
+  when anything else speaks: `s`, another row's audition, an auto-spoken answer.
+* Leaving the row and returning starts it again, so an interrupted row is not permanently silent.
+
+The panel schedules no audio and owns no timer. It asks for the repeat and remembers that it asked
+(`Preview::Explain`); the playback thread is what repeats the line, re-reading the live settings
+before each repetition, until a Stop, a newer request, or an unplayable line ends it — so a broken
+player cannot turn an explanation into an endless retry.
 
 ## Settings
 
@@ -169,6 +203,12 @@ manifest and travels with the directory.
     becomes clearly audible.
   * Too high and words start to slip: that begins around `2` for the default model, and by `5`
     the speech is often garbled. Other models may differ. Negative values are rejected.
+
+  Each utterance is synthesized from its own noise seed — one per request, counting up from a base
+  drawn when the extension starts — so the same sentence spoken twice is two takes, and the line the
+  Temperature row repeats while you hold the arrow really does change as you step it. Setting
+  `ZOT_SPEAKS_SEED=<n>` pins that base, which replays a run's utterances in order; at temperature `0`
+  there is no noise for the seed to vary, so repeats there are identical by design.
 
   So temperature is neither loudness nor speed — it is the knob for "say that again
   differently", not for "say it louder". The panel clamps it to `0.0`–`1.0`, which keeps the
