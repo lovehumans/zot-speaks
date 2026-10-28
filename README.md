@@ -6,7 +6,7 @@ machine. No network access, no account, no cloud voice.
 
 [Features](#features-and-anti-features) · [Requirements](#requirements) · [Usage](#usage) ·
 [Install](#install) · [For developers](#for-developers) · [Acknowledgements](#acknowledgements) ·
-[License](#license) · [Design notes](#design-notes)
+[License](#license) · [Design notes](#design-notes) · [Changelog](CHANGELOG.md)
 
 ## Features and Anti-Features
 
@@ -15,7 +15,8 @@ machine. No network access, no account, no cloud voice.
 | ✅ Offline, no network access | ❌ Cloud / online TTS of any kind |
 | ✅ CPU-only inference → the GPU stays free for your local LLM | ❌ Telemetry, accounts, anything that phones home |
 | ✅ A small permissive English model, `gradium/phonon-31m-en` | ❌ Voice cloning — this checkpoint has no speaker encoder |
-| ✅ Streams while generating; `/tts stop` cuts off cleanly | ❌ Speed / tempo control |
+| ✅ Streams while generating; `/tts stop` cuts off cleanly | ❌ Retrying a player that failed, or falling back to one you pinned away |
+| ✅ Speed `0.5x`–`2.0x` in `0.1` steps, applied by the player, not by the model | |
 | ✅ Auto-speak of the final answer, scoped per project | |
 
 Phonon is a 31 M-parameter model: natural speech with imperfect prosody, not a commercial studio
@@ -45,13 +46,14 @@ session — a one-shot `zot -p "…"` tears the extension down before the audio 
 |---|---|
 | `/tts` | Speak the most recent agent message. |
 | `/tts stop` | Cut the current utterance off cleanly — no audio tail. |
-| `/tts-settings` | Open a panel to pick voice, volume, temperature and auto-speak. |
+| `/tts-settings` | Open a panel to pick voice, volume, temperature, speed and auto-speak. |
 
 The settings panel:
 
 ```
 > Voice        Everly  (37 ready of 37 en voices)
   Volume       55%
+  Speed        1.0x
   Temperature  0.30
   Auto speak   off
 ```
@@ -65,13 +67,19 @@ the command that fetches them.
 Auto-speak reads the agent's final answer aloud when a turn ends. It is scoped per project, and
 the row cycles `off → here → everywhere`.
 
+**Speed** is a request to the player, not to the model: Phonon always synthesizes at its own 24 kHz
+natural rate and `ffplay` is asked for the tempo (`atempo`), which stretches the time without shifting
+the pitch. `paplay` has no tempo flag, so `ZOT_SPEAKS_SINK=paplay` always speaks at `1.0x` — and says
+so once rather than letting the Speed row read as a broken promise.
+
 ## Install
 
 Install once; zot runs it from then on. Nothing is ever downloaded at runtime.
 
 Grab the binary from the latest [Release](https://github.com/lovehumans/zot-speaks/releases)
 named `zot-speaks` (x86-64 Linux) together with the `SHA256SUMS` file; the release notes print the same
-digest. On macOS there is no Release binary to grab: build from source, below.
+digest. Every Release lists what changed in it, and that text is [CHANGELOG.md](CHANGELOG.md) in this
+repository. On macOS there is no Release binary to grab: build from source, below.
 
 If you have [just](https://github.com/casey/just), two recipes do exactly this — they are
 plain `curl` + `sha256sum` + `zot ext install`, readable in the [justfile](justfile):

@@ -4,11 +4,11 @@
 //! normalized `panel_key` events (`up`, `down`, `left`, `right`, `enter`, `esc`, …, or `rune`
 //! with a `text` character). We edit `Settings` live and hand back frames the caller serialises.
 //!
-//! Main view — cursor over four rows (Voice, Volume, Temperature, Auto speak):
+//! Main view — cursor over five rows (Voice, Volume, Speed, Temperature, Auto speak):
 //!   up/down      move the cursor
-//!   left/right   (or +/-) adjust the focused row; a Volume change then speaks the selected
-//!                voice, so the new level is heard rather than read. On Auto speak they step a
-//!                three-value ring: off -> on · here -> on · everywhere -> off.
+//!   left/right   (or +/-) adjust the focused row; a Volume or Speed change then speaks the
+//!                selected voice, so the new level or rate is heard rather than read. On Auto
+//!                speak they step a three-value ring: off -> on · here -> on · everywhere -> off.
 //!   enter        open the voice picker when the cursor sits on Voice
 //!   s            speak the last agent message in the selected voice (a voice audition)
 //!   esc          close the panel
@@ -37,10 +37,15 @@ pub const PANEL_ID: &str = "zot-speaks-settings";
 /// Volume moves in 5% of the dial (see `settings::Settings::gain`: 50% is the voice's own level).
 const VOLUME_STEP: f32 = 0.05;
 const TEMPERATURE_STEP: f32 = 0.05;
-const ROWS: usize = 4; // Voice, Volume, Temperature, Auto speak
+/// The rows of the main view, in cursor order.
+const ROWS: usize = 5;
+const VOICE_ROW: usize = 0;
+const VOLUME_ROW: usize = 1;
+const SPEED_ROW: usize = 2;
+const TEMPERATURE_ROW: usize = 3;
 /// The row whose value is a ring of three states rather than a number, so arrows step it instead
 /// of adjusting it (see `settings::AutoSpeak`).
-const AUTO_SPEAK_ROW: usize = 3;
+const AUTO_SPEAK_ROW: usize = 4;
 /// Floor for the picker's name column; it grows to fit the longest catalog name.
 const MIN_NAME_WIDTH: usize = 18;
 /// Detail rows under the voice list, and the widest panel line we ever emit. Every line is
@@ -197,7 +202,9 @@ impl SettingsPanel {
         // changes the panel height when you move between rows.
         match self.mode {
             Mode::Main => match self.focus {
-                0 => "up/down move   enter choose voice   s last message   esc close".to_string(),
+                VOICE_ROW => {
+                    "up/down move   enter choose voice   s last message   esc close".to_string()
+                }
                 AUTO_SPEAK_ROW => {
                     "left/right off · here · everywhere   s last message   esc close".to_string()
                 }
@@ -222,18 +229,19 @@ impl SettingsPanel {
             crate::tts::MODEL_LANGUAGE
         );
         vec![
-            self.row(0, "Voice", &format!("{voice_display}  ({summary})")),
+            self.row(VOICE_ROW, "Voice", &format!("{voice_display}  ({summary})")),
             self.row(
-                1,
+                VOLUME_ROW,
                 "Volume",
                 &format!("{:.0}%", self.settings.volume * 100.0),
             ),
+            self.row(SPEED_ROW, "Speed", &self.settings.speed.label()),
             self.row(
-                2,
+                TEMPERATURE_ROW,
                 "Temperature",
                 &format!("{:.2}", self.settings.temperature),
             ),
-            self.row(3, "Auto speak", &self.auto_speak_display()),
+            self.row(AUTO_SPEAK_ROW, "Auto speak", &self.auto_speak_display()),
         ]
     }
 
@@ -386,7 +394,7 @@ impl SettingsPanel {
                 stay(None)
             }
             "enter" => {
-                if self.focus == 0 {
+                if self.focus == VOICE_ROW {
                     // Opening the picker previews the voice it lands on, so the first thing you
                     // hear is the voice you are about to browse.
                     self.mode = Mode::Voice;
@@ -493,11 +501,11 @@ impl SettingsPanel {
         }
     }
 
-    /// Step the focused row. A Volume change is followed by an audition of the voice you selected,
-    /// so the new level is something you hear rather than a number you read. Temperature stays
-    /// silent: it changes *how* a voice speaks (see `tts::build_options`), which a name-only line
-    /// cannot show. Auto-speak makes no sound of its own either — the next agent turn is its
-    /// feedback — and its arrows step the off / here / everywhere ring.
+    /// Step the focused row. A Volume or Speed change is followed by an audition of the voice you
+    /// selected, so the new level or rate is something you hear rather than a number you read.
+    /// Temperature stays silent: it changes *how* a voice speaks (see `tts::build_options`), which a
+    /// name-only line cannot show. Auto-speak makes no sound of its own either — the next agent turn
+    /// is its feedback — and its arrows step the off / here / everywhere ring.
     fn nudge(&mut self, direction: f32) -> KeyOutcome {
         if self.focus == AUTO_SPEAK_ROW {
             // A ring of three states: every arrow lands somewhere new, so there is no press that
@@ -507,7 +515,7 @@ impl SettingsPanel {
             return stay_changed(true, None);
         }
         let changed = self.adjust(self.focus, direction);
-        if changed && self.focus == 1 {
+        if changed && (self.focus == VOLUME_ROW || self.focus == SPEED_ROW) {
             let voice = self.settings.voice.clone();
             let text = quick_introduction(&self.voice_display());
             stay_changed(changed, Some(Preview::Voice { voice, text }))
@@ -519,14 +527,22 @@ impl SettingsPanel {
     /// Apply a signed step to the focused numeric row. Returns whether anything changed.
     fn adjust(&mut self, focus: usize, direction: f32) -> bool {
         match focus {
-            1 => {
+            VOLUME_ROW => {
                 let target = (self.settings.volume + direction * VOLUME_STEP).clamp(0.0, 1.0);
                 if target != self.settings.volume {
                     self.settings.volume = target;
                     return true;
                 }
             }
-            2 => {
+            SPEED_ROW => {
+                let step = if direction < 0.0 { -1 } else { 1 };
+                let target = self.settings.speed.stepped(step);
+                if target != self.settings.speed {
+                    self.settings.speed = target;
+                    return true;
+                }
+            }
+            TEMPERATURE_ROW => {
                 let target =
                     (self.settings.temperature + direction * TEMPERATURE_STEP).clamp(0.0, 1.0);
                 if target != self.settings.temperature {
@@ -707,6 +723,7 @@ fn mark_continued(row: &mut String, width: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{SPEED_MAX, SPEED_MIN};
     use std::path::PathBuf;
 
     fn voice(name: &str, available: bool) -> VoiceInfo {
@@ -1238,7 +1255,9 @@ mod tests {
             panel.footer()
         );
 
-        // Temperature changes how a voice speaks, not its level: no audition there.
+        // Temperature changes how a voice speaks, not its level or its rate: no audition there. Two
+        // steps down from Volume crosses the Speed row to reach it.
+        panel.on_key("down", "");
         panel.on_key("down", "");
         assert_eq!(
             preview_of(panel.on_key("right", "")),
@@ -1266,6 +1285,66 @@ mod tests {
         assert!(
             (ceiling.settings().volume - 1.0).abs() < 1e-6,
             "the dial clamps at 100%"
+        );
+    }
+
+    /// The Speed ladder as the panel walks it: one rung per arrow, `1.0x` in the middle, both ends
+    /// shut, and — like Volume — every real change audible. Counted in tenths rather than a float
+    /// dial, so three arrows from `1.0x` are `1.3x` and not `1.2999999`.
+    #[test]
+    fn speed_steps_by_a_tenth_and_stops_at_the_ends_of_the_ladder() {
+        let mut panel = SettingsPanel::new(catalog());
+        panel.open(&Settings {
+            voice: "Miles".into(),
+            ..Settings::default()
+        });
+        panel.on_key("down", ""); // Volume
+        panel.on_key("down", ""); // Speed
+
+        for _ in 0..3 {
+            panel.on_key("right", "");
+        }
+        assert_eq!(panel.settings().speed.label(), "1.3x");
+        assert!(
+            panel.lines()[SPEED_ROW].contains("1.3x"),
+            "the row shows the rate it will speak at: {:?}",
+            panel.lines()[SPEED_ROW]
+        );
+
+        // A rate is something you hear, so the row auditions the selected voice as Volume does.
+        assert_eq!(
+            preview_of(panel.on_key("right", "")),
+            Some(Preview::Voice {
+                voice: "Miles".into(),
+                text: "Hello, my name is Miles.".into(),
+            }),
+            "a speed change should be audible"
+        );
+
+        // Past the ends there is nothing to step to, and a press that changes nothing stays quiet.
+        for _ in 0..30 {
+            panel.on_key("right", "");
+        }
+        assert_eq!(panel.settings().speed, SPEED_MAX, "the ceiling is 2.0x");
+        assert_eq!(
+            preview_of(panel.on_key("right", "")),
+            None,
+            "a rung that does not move has nothing to audition"
+        );
+
+        for _ in 0..40 {
+            panel.on_key("left", "");
+        }
+        assert_eq!(panel.settings().speed, SPEED_MIN, "the floor is 0.5x");
+        assert!(
+            panel.lines()[SPEED_ROW].contains("0.5x"),
+            "{:?}",
+            panel.lines()[SPEED_ROW]
+        );
+        assert_eq!(
+            preview_of(panel.on_key("left", "")),
+            None,
+            "and the floor is quiet too"
         );
     }
 
@@ -1405,18 +1484,23 @@ mod tests {
             ..Settings::default()
         });
         let lines = panel.lines();
-        assert!(
-            lines[1].contains("Volume") && lines[1].contains("50%"),
-            "{lines:?}"
-        );
-        assert!(
-            lines[2].contains("Temperature") && lines[2].contains("0.30"),
-            "the temperature a request is made at has to be readable, not just the row name: {lines:?}"
-        );
-        assert!(
-            lines[3].contains("Auto speak") && lines[3].contains("off"),
-            "{lines:?}"
-        );
+        // A row that only shows its own name is not a setting you can read. The five values here are
+        // the defaults a fresh install is spoken at, so they are also the contract's baseline.
+        for (row, (name, value)) in [
+            ("Voice", "Miles"),
+            ("Volume", "50%"),
+            ("Speed", "1.0x"),
+            ("Temperature", "0.30"),
+            ("Auto speak", "off"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                lines[row].contains(name) && lines[row].contains(value),
+                "row {row} should read as {name} {value}: {lines:?}"
+            );
+        }
     }
 
     /// The Auto speak row as rendered, with its cursor marker when the cursor is on it.

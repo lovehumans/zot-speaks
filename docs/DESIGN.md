@@ -27,24 +27,29 @@ extension does and how to run it, see [../README.md](../README.md).
 * Stop is cooperative: the `SpeechStream` is dropped and the player's stdin is closed (EOF). An
   utterance that ran to its end gets to drain whatever the player holds; one that was cut short gets
   a 150 ms grace and is then killed rather than left orphaned, because `paplay` exits on EOF at once
-  while `ffplay` sits on an SDL audio buffer. A player that gives up on its own has its stderr
-  reported as a notification; one killed on purpose does not.
+  while `ffplay` sits on an SDL audio buffer. A player that gives up on its own is reported with its
+  own words as a notification; one killed on purpose is not. `ffplay`'s exit status is not trusted:
+  measured with n9.0.2, an unopenable audio device, an unreadable input and an unknown filter each
+  exit **0**, so its stderr is read whatever the status claims and only its fatal lines count as
+  failure — the warnings a healthy PipeWire box writes to the same pipe stay silent.
 
 ## The settings panel
 
 ```
 > Voice        Everly  (37 ready of 37 en voices)
   Volume       55%
+  Speed        1.0x
   Temperature  0.30
   Auto speak   off
 ```
 
 Keys: `up`/`down` move the cursor · `left`/`right` (or `-`/`+`) adjust the focused row — a
-**Volume change then says the selected voice out loud at the new level**, so a level is something
-you hear rather than a number you read, and on **Auto speak** they step that row around its three
-values (`off` → `on · here` → `on · everywhere`) · `enter` on the **Voice** row opens the picker ·
-`s` speaks the last agent message in the selected voice · `esc` closes the panel (or returns from
-the picker). A pinned voice is marked on the Voice row (`Everly ★`).
+**Volume or Speed change then says the selected voice out loud at the new level or rate**, so a
+level and a rate are something you hear rather than a number you read, and on **Auto speak** they
+step that row around its three values (`off` → `on · here` → `on · everywhere`) · `enter` on the
+**Voice** row opens the picker · `s` speaks the last agent message in the selected voice · `esc`
+closes the panel (or returns from the picker). A pinned voice is marked on the Voice row
+(`Everly ★`).
 
 Voice picker — every **English** catalog voice in three blocks separated by a blank line (pinned
 favorites, ready voices, not-yet-downloaded voices), in two columns:
@@ -106,15 +111,17 @@ Hello, my name is Juniper. Warm, expressive voice with a bright, agile delivery�
   introduction, in a voice you have not committed. `esc` back to the main view, or closing the
   panel, stops whatever is speaking.
 * `f` re-auditions the voice it just pinned — hearing it is how you know the pin landed.
-* On the main view a **Volume** change is followed by the selected voice saying its own name at
-  the new level: the same short line at 40% and at 90% is a faster way to choose a level than
-  reading a percentage. Temperature changes stay silent, because temperature is not a level.
+* On the main view a **Volume** or **Speed** change is followed by the selected voice saying its own
+  name at the new level or rate: the same short line at 40% and at 90%, at 0.8x and at 1.4x, is a
+  faster way to choose than reading a number. Temperature changes stay silent, because temperature
+  is neither a level nor a rate — it changes *which* take you get, and a name-only line cannot show
+  that.
 
 ## Settings
 
 Settings persist to `<data_dir>/settings.json` (written on the first run with a sensible
-default voice, then on every change), so voice / volume / temperature / favorites / auto-speak
-survive across sessions and are picked up by the next `/tts`.
+default voice, then on every change), so voice / volume / speed / temperature / favorites /
+auto-speak survive across sessions and are picked up by the next `/tts`.
 
 `data_dir` is the extension's own installed directory — `<project>/.zot/extensions/zot-speaks`,
 or `$ZOT_HOME/extensions/zot-speaks` for a global install — so that file lives beside its
@@ -125,6 +132,7 @@ manifest and travels with the directory.
   "voice": "Everly",
   "temperature": 0.3,
   "volume": 0.55,
+  "speed": 1.2,
   "favorites": ["Everly", "Juniper"],
   "auto_speak": false,
   "auto_speak_projects": {"/work/repo": true},
@@ -138,6 +146,16 @@ manifest and travels with the directory.
   converting the model's float PCM to 16-bit samples is **twice** the dial, so `50%` is unity:
   the voice at its own level, neither boosted nor attenuated. `100%` doubles it, which is the
   headroom a quiet voice needs, and the clamp keeps `100%` from clipping anything louder.
+* **Speed** — a ladder from `0.5x` to `2.0x` in `0.1` steps, default `1.0x`, stored as the plain
+  number you would say (`1.2`). It is a **player** setting, not a model setting: Phonon always
+  synthesizes at its own natural rate, and the chosen player is asked for the tempo — `ffplay`
+  through ffmpeg's `atempo` filter (`-af atempo=1.2`), which stretches time without shifting pitch.
+  `paplay` has no tempo flag, so a speak through it is spoken at `1.0x` whatever the row says, and
+  the extension says so out loud once per session rather than letting the row read as a promise
+  nothing kept; the note names `ZOT_SPEAKS_SINK=ffplay` as the pin that would honor it. A value
+  hand-edited off the ladder (`3.5`) is honoured as the nearest rung and announced, not discarded.
+  The real-time pacing of the PCM writer follows the rate actually spoken, so a faster request
+  drains faster instead of starving the player.
 * **Temperature** — how much random noise Phonon puts into generating the speech, `0.0`–`1.0`,
   passed per request (`SpeechOptions.temperature`). Phonon renders speech by **flow matching**:
   it speaks one short frame at a time, and for each frame the model starts from seeded noise and
@@ -324,8 +342,11 @@ crate cache, not a source problem.
 
 ## Known limits and open questions
 
-* **No speed / time-stretch control.** Phonon exposes no native tempo control, so a
-  pitch-preserving time-stretch would have to be implemented client-side. Open, not scheduled.
+* **Speed rides on ffmpeg's filter, not on the model.** Phonon exposes no native tempo control, so
+  `atempo` (see the *Speed* setting) is what makes the dial mean anything, and it is a linear
+  time-stretch: it cannot repair prosody, and the artifacts it does introduce are ffmpeg's. A
+  player-independent stretch (WSOLA or a phase vocoder in our own write path) would free the setting
+  from `ffplay` and from `paplay`'s silence about it. Not scheduled.
 * **Quantisation is untried.** The Rust API exposes `Quant` (`q8_0`, `q4k`, CPU-only) and `ptts`
   exposes `--quant`; this extension uses `Quant::F32`. Worth measuring before changing it.
   Note that the shipped model weights are what your cache holds — a quantised build needs the
