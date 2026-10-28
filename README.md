@@ -12,33 +12,24 @@ machine. No network access, no account, no cloud voice.
 
 | ✅ We do | ❌ We deliberately don't |
 |---|---|
-| ✅ Offline, no network access | ❌ Cloud / online TTS of any kind |
+| ✅ Fully offline | ❌ Cloud / online TTS of any kind, network access |
 | ✅ CPU-only inference → the GPU stays free for your local LLM | ❌ Telemetry, accounts, anything that phones home |
-| ✅ A small permissive English model, `gradium/phonon-31m-en` | ❌ Voice cloning — this checkpoint has no speaker encoder |
-| ✅ Streams while generating; `/tts stop` cuts off cleanly | ❌ Retrying a player that failed, or falling back to one you pinned away |
-| ✅ Speed `0.5x`–`2.0x` in `0.1` steps, applied by the player, not by the model | |
+| ✅ A small English model, `gradium/phonon-31m-en`, with 37 voices | ❌ Voice cloning |
+| ✅ Instant streaming audio |  |
+| ✅ Pitch-invariant speed control | |
 | ✅ Auto-speak of the final answer, scoped per project | |
 
 Phonon is a 31 M-parameter model: natural speech with imperfect prosody, not a commercial studio
-voice. Output is mono 24 kHz, piped to a player that reads raw PCM from a pipe: `ffplay` (from
-ffmpeg) by default, or `paplay` where ffmpeg is not installed. Speaking needs a live interactive
-session — a one-shot `zot -p "…"` tears the extension down before the audio finishes.
+voice. Output is mono 24 kHz, piped to a player that reads raw PCM from a pipe.  
 
 ## Requirements
 
-- `ffmpeg` (which provides `ffplay`, the default player on Linux and macOS) or `paplay` (PipeWire /
-  PulseAudio). No other audio setup is needed: the extension pipes raw PCM to the first player it
-  finds — `ffplay`, then `paplay` — and says so when neither is there.
-- macOS is source-build only — there is no macOS Release binary. You need a Rust toolchain and
-  [just](https://github.com/casey/just); see [Install](#install) and [docs/MACOS.md](docs/MACOS.md).
-- `ZOT_SPEAKS_SINK=paplay|ffplay` pins one player when more than one is installed — for instance
-  `ZOT_SPEAKS_SINK=paplay` on a PipeWire box; empty or unset picks automatically, and a name that
-  is not a player is reported rather than ignored.
+- `ffplay` (provided by `ffmpeg`, on Linux and macOS) or the fallback `paplay` (PipeWire / PulseAudio, on Linux). 
 - CPU only — no GPU, no CUDA, no Metal. That is the point: the GPU stays free for your local LLM.
 - [The model](https://huggingface.co/gradium/phonon-31m-en) (99 MiB) and [the voices](https://huggingface.co/gradium/phonon-voices) (9 MiB) it uses must already be in your Hugging Face cache (helper scripts provided); this extension
   reads the cache and never downloads. Cache location: `$HF_HUB_CACHE`, `$HF_HOME/hub`,
   `$XDG_CACHE_HOME/huggingface/hub`, or `$HOME/.cache/huggingface/hub`.
-- English only: `phonon-31m-en` is an English model, so only English catalog voices are offered.
+- zot - obviously
 
 ## Usage
 
@@ -59,7 +50,10 @@ The settings panel:
 ```
 
 `up`/`down` move, `left`/`right` adjust the focused row, `enter` opens the voice picker, `s`
-speaks the last message in the highlighted voice, `esc` closes. In the picker, moving the cursor
+speaks the last message in the highlighted voice, `esc` closes. Volume and Speed changes speak the
+selected voice at the new level or rate, and while the **Temperature** row is selected it keeps
+saying what it does — *Temperature adds variety to how a sentence is pronounced.* — repeating until
+you move off it. In the picker, moving the cursor
 **says each voice out loud** (ready voices only), `f` pins a favourite, and voices whose embedding
 is not in your cache yet are listed greyed as `not downloaded`; the bootstrap section below gives
 the command that fetches them.
@@ -67,13 +61,16 @@ the command that fetches them.
 Auto-speak reads the agent's final answer aloud when a turn ends. It is scoped per project, and
 the row cycles `off → here → everywhere`.
 
-**Speed** is a request to the player, not to the model: Phonon always synthesizes at its own 24 kHz
-natural rate and `ffplay` is asked for the tempo (`atempo`), which stretches the time without shifting
-the pitch. `paplay` has no tempo flag, so `ZOT_SPEAKS_SINK=paplay` always speaks at `1.0x` — and says
-so once rather than letting the Speed row read as a broken promise.
+**Speed** is a tempo setting, which stretches the time without shifting
+the pitch. `paplay` has no tempo flag, so `ZOT_SPEAKS_SINK=paplay` always speaks at `1.0x` — and says so once rather than letting the Speed row read as a broken promise.
+
+**Repeats are new takes.** Every utterance is synthesized from its own noise seed, so saying the same
+line twice is not a replay — which is what makes the Temperature row audible as you step it. Set
+`ZOT_SPEAKS_SEED=42` in the environment when you want a session's utterances reproducible in order.
 
 ## Install
 
+### Linux 
 Install once; zot runs it from then on. Nothing is ever downloaded at runtime.
 
 Grab the binary from the latest [Release](https://github.com/lovehumans/zot-speaks/releases)
@@ -128,6 +125,8 @@ against its `SHA256SUMS`, and swaps them; `just update-ext` does the same from a
 manifest matters because zot reads it at load: `zot ext list` reports the version *it* says, so a
 swap that carries only the binary leaves an installation advertising a version it does not run.
 Releases before v1.7.15 publish the binary alone, and then the recipe says so instead of pretending.
+The `/tts-settings` panel reports the same identity on its last row, so the version you are actually
+running is readable without leaving zot.
 
 <details>
 <summary>Or update by hand (no `just` needed)</summary>
@@ -150,6 +149,8 @@ cp "$tmp/extension.json" "$installed/extension.json"        # the version zot re
 </details>
 
 A running zot keeps the old binary open; the new one takes effect at the next zot start.
+
+### Building from source
 
 <details>
 <summary>Installing by building from source (alternative to the Release binary)</summary>
@@ -200,10 +201,21 @@ mv -f "$installed/zot-speaks.new" "$installed/zot-speaks"
 
 </details>
 
+### macOS
+
+macOS is source-build only — there is no macOS Release binary. You need a Rust toolchain and
+[just](https://github.com/casey/just); see [docs/MACOS.md](docs/MACOS.md).
+
+### Windows
+
+Windows isn't tested yet, but should theoretically work just the same as macOS: build from source, with
+`ffplay` from ffmpeg on your `PATH` (`paplay` is the Linux fallback and does not exist there). If you
+test it, let me know!
+
 ### One-time bootstrap
 
 `zot-speaks` never downloads: it only reads the Hugging Face cache. Filling that cache is the one
-network step, and it needs the upstream `ptts` CLI on your `PATH` — get it from the [official
+network step, and it needs the upstream `ptts` CLI in the cloned `zot-speaks` dir or on your `PATH` — get it from the [official
 releases](https://github.com/gradium-ai/xn-ptts/releases).
 
 ```sh
@@ -211,7 +223,7 @@ just bootstrap   # the model (~99 MiB) plus all 37 English voices (~9 MiB), once
 just cache       # what the extension can see right now: snapshot, and how many voices are ready
 ```
 
-Or in pieces. `just fetch-model` fetches the model and one voice in a single run (`just fetch-model
+Or in individual steps. `just fetch-model` fetches the model and one voice in a single run (`just fetch-model
 VOICE=Aria` chooses the voice). `just fetch-voices` fills the rest of the English catalog and skips
 whatever is already cached, so re-running it is also the coverage check: it prints
 `fetched/skipped/failed` counts. Both are thin wrappers over `dev/prefetch-en-voices.sh` and the

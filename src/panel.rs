@@ -7,8 +7,10 @@
 //! Main view — cursor over five rows (Voice, Volume, Speed, Temperature, Auto speak):
 //!   up/down      move the cursor
 //!   left/right   (or +/-) adjust the focused row; a Volume or Speed change then speaks the
-//!                selected voice, so the new level or rate is heard rather than read. On Auto
-//!                speak they step a three-value ring: off -> on · here -> on · everywhere -> off.
+//!                selected voice, so the new level or rate is heard rather than read. On the
+//!                Temperature row they start that row's explanation of itself, which goes on
+//!                repeating while the cursor stays there (see `Preview::Explain`). On Auto speak
+//!                they step a three-value ring: off -> on · here -> on · everywhere -> off.
 //!   enter        open the voice picker when the cursor sits on Voice
 //!   s            speak the last agent message in the selected voice (a voice audition)
 //!   esc          close the panel
@@ -26,7 +28,8 @@
 //! only silences the previous voice.
 //!
 //! Audio is not this module's business: `on_key` returns a `Preview` describing what the caller
-//! should say, in which voice, and the caller (main.rs) owns the synth and the sink.
+//! should say, in which voice, and the caller (main.rs) owns the synth and the sink. Every preview
+//! is one utterance except `Explain`, which the caller repeats until it is cut off.
 
 use crate::settings::Settings;
 use crate::voices::VoiceInfo;
@@ -37,6 +40,10 @@ pub const PANEL_ID: &str = "zot-speaks-settings";
 /// Volume moves in 5% of the dial (see `settings::Settings::gain`: 50% is the voice's own level).
 const VOLUME_STEP: f32 = 0.05;
 const TEMPERATURE_STEP: f32 = 0.05;
+/// What the Temperature row says while it is the selected row, and why it has to be said out loud:
+/// a temperature is heard as variety in a whole sentence, not as a number on a row, and a name-only
+/// audition (what Volume and Speed use) cannot show it at all.
+const TEMPERATURE_HINT: &str = "Temperature adds variety to how a sentence is pronounced.";
 /// The rows of the main view, in cursor order.
 const ROWS: usize = 5;
 const VOICE_ROW: usize = 0;
@@ -56,6 +63,10 @@ const DETAIL_ROWS: usize = 2;
 const DETAIL_WIDTH: usize = 70;
 const ROW_INDENT: usize = 2;
 const DETAIL_TEXT_WIDTH: usize = DETAIL_WIDTH - ROW_INDENT;
+/// The panel's own identity, as its last body row. `CARGO_PKG_NAME` is the name `extension.json`
+/// registers, so this names exactly what `zot ext list` and the installer report: the question
+/// "did the update land?" is answerable from the panel.
+const IDENTITY_LINE: &str = concat!(env!("CARGO_PKG_NAME"), " v", env!("CARGO_PKG_VERSION"));
 
 /// The line a voice speaks when the cursor lands on it, and how much of its description may be
 /// read out. Whole descriptions run to 300 characters, which is far too long to listen to while
@@ -76,6 +87,10 @@ pub enum Preview {
     Voice { voice: String, text: String },
     /// Speak the last agent message in `voice` (`""` = whatever the settings select).
     LastMessage { voice: String },
+    /// Say `text` in `voice`, and go on saying it: the caller repeats it until something else
+    /// speaks, the panel closes, or a `Silence` takes the request back. Asked for while the
+    /// Temperature row holds the cursor.
+    Explain { voice: String, text: String },
     /// Cut off whatever is playing: the cursor landed on a voice we cannot synthesize.
     Silence,
 }
@@ -97,6 +112,11 @@ pub struct SettingsPanel {
     /// The project this session is running in. Auto-speak is scoped per project, so the panel
     /// needs to know which project it is editing on the user's behalf.
     project: PathBuf,
+    /// Whether the panel has last asked the caller to keep explaining the Temperature row. The
+    /// panel schedules no audio and owns no timer: this is only its memory of the request it made,
+    /// so an arrow on that row does not restart a sentence that is already running, and walking off
+    /// the row takes the request back with a `Silence`.
+    explaining_temperature: bool,
 }
 
 impl SettingsPanel {
@@ -108,6 +128,7 @@ impl SettingsPanel {
             voices,
             settings: Settings::default(),
             project: PathBuf::from("."),
+            explaining_temperature: false,
         }
     }
 
@@ -125,6 +146,7 @@ impl SettingsPanel {
         self.voice_idx = self.voice_position(&self.settings.voice);
         self.mode = Mode::Main;
         self.focus = 0;
+        self.explaining_temperature = false;
     }
 
     pub fn settings(&self) -> &Settings {
@@ -191,19 +213,33 @@ impl SettingsPanel {
     }
 
     pub fn lines(&self) -> Vec<String> {
-        match self.mode {
+        let mut lines = match self.mode {
             Mode::Main => self.main_lines(),
             Mode::Voice => self.voice_lines(),
-        }
+        };
+        // What we are running, on the panel's last row and right-aligned, so it reads as a caption
+        // and not as a sixth setting. It is a body row rather than part of the footer because a footer
+        // is one string: zot prints a newline inside it but counts the footer as one row, so each
+        // repaint leaves a row of the previous frame behind the panel. Padded to `DETAIL_WIDTH`, this
+        // row is exactly as wide as the widest body row and is therefore never wrapped either.
+        lines.push(format!(
+            "{}{IDENTITY_LINE}",
+            " ".repeat(DETAIL_WIDTH - IDENTITY_LINE.chars().count())
+        ));
+        lines
     }
 
     pub fn footer(&self) -> String {
-        // Kept within DETAIL_WIDTH for the same reason the body lines are: a footer that wraps
+        // One row, within DETAIL_WIDTH for the same reason the body lines are: a footer that wraps
         // changes the panel height when you move between rows.
         match self.mode {
             Mode::Main => match self.focus {
                 VOICE_ROW => {
                     "up/down move   enter choose voice   s last message   esc close".to_string()
+                }
+                TEMPERATURE_ROW => {
+                    "arrows or -/+ (audible)   s last message   · repeats while selected"
+                        .to_string()
                 }
                 AUTO_SPEAK_ROW => {
                     "left/right off · here · everywhere   s last message   esc close".to_string()
@@ -386,12 +422,14 @@ impl SettingsPanel {
     fn on_key_main(&mut self, key: &str, text: &str) -> KeyOutcome {
         match key {
             "up" => {
+                let previous = self.focus;
                 self.focus = (self.focus + ROWS - 1) % ROWS;
-                stay(None)
+                self.moved_cursor(previous)
             }
             "down" => {
+                let previous = self.focus;
                 self.focus = (self.focus + 1) % ROWS;
-                stay(None)
+                self.moved_cursor(previous)
             }
             "enter" => {
                 if self.focus == VOICE_ROW {
@@ -411,9 +449,14 @@ impl SettingsPanel {
                 "-" | "_" => self.nudge(-1.0),
                 // An audition of the voice actually selected, on real text rather than the
                 // canned introduction.
-                "s" => stay(Some(Preview::LastMessage {
-                    voice: self.settings.voice.clone(),
-                })),
+                "s" => {
+                    // The last message is an utterance of its own: it cuts the explanation off, so
+                    // the row stops asking for one.
+                    self.explaining_temperature = false;
+                    stay(Some(Preview::LastMessage {
+                        voice: self.settings.voice.clone(),
+                    }))
+                }
                 _ => stay(None),
             },
             _ => stay(None),
@@ -501,11 +544,38 @@ impl SettingsPanel {
         }
     }
 
+    /// The cursor moved in the main view. Only one move has anything to say: the Temperature row
+    /// starts explaining itself when the cursor arrives on it and is silenced when the cursor
+    /// leaves, so the explanation is bounded by the row being selected rather than by a number of
+    /// repetitions. Every other move is as silent as it always was.
+    fn moved_cursor(&mut self, previous: usize) -> KeyOutcome {
+        if self.focus != TEMPERATURE_ROW {
+            if previous == TEMPERATURE_ROW && self.explaining_temperature {
+                self.explaining_temperature = false;
+                return stay(Some(Preview::Silence));
+            }
+            return stay(None);
+        }
+        stay(Some(self.explain_temperature()))
+    }
+
+    /// Ask the caller to keep saying what Temperature does, in the voice currently selected.
+    /// Repeating is the caller's job (see `Preview::Explain`); this only records that we asked, so
+    /// the next arrow on the row leaves the running sentence alone.
+    fn explain_temperature(&mut self) -> Preview {
+        self.explaining_temperature = true;
+        Preview::Explain {
+            voice: self.settings.voice.clone(),
+            text: TEMPERATURE_HINT.to_string(),
+        }
+    }
+
     /// Step the focused row. A Volume or Speed change is followed by an audition of the voice you
     /// selected, so the new level or rate is something you hear rather than a number you read.
-    /// Temperature stays silent: it changes *how* a voice speaks (see `tts::build_options`), which a
-    /// name-only line cannot show. Auto-speak makes no sound of its own either — the next agent turn
-    /// is its feedback — and its arrows step the off / here / everywhere ring.
+    /// Temperature explains itself instead (see `moved_cursor`): it changes *how* a voice speaks
+    /// (see `tts::build_options`), which a name-only line cannot show. Auto-speak makes no sound of
+    /// its own either — the next agent turn is its feedback — and its arrows step the off / here /
+    /// everywhere ring.
     fn nudge(&mut self, direction: f32) -> KeyOutcome {
         if self.focus == AUTO_SPEAK_ROW {
             // A ring of three states: every arrow lands somewhere new, so there is no press that
@@ -519,6 +589,16 @@ impl SettingsPanel {
             let voice = self.settings.voice.clone();
             let text = quick_introduction(&self.voice_display());
             stay_changed(changed, Some(Preview::Voice { voice, text }))
+        } else if self.focus == TEMPERATURE_ROW {
+            // An arrow here means the user is adjusting the temperature, whether or not this press
+            // landed on a new value: that is the moment the row has to explain itself, and if it is
+            // already doing so the running sentence carries on.
+            let explanation = if self.explaining_temperature {
+                None
+            } else {
+                Some(self.explain_temperature())
+            };
+            stay_changed(changed, explanation)
         } else {
             stay_changed(changed, None)
         }
@@ -750,6 +830,15 @@ mod tests {
         ]
     }
 
+    /// Every frame's body ends with this many rows that belong to the frame rather than to a view:
+    /// the identity caption. Height models count it explicitly.
+    const CAPTION_ROWS: usize = 1;
+
+    /// The widest row of a footer: what has to fit on one screen row.
+    fn footer_width(footer: &str) -> usize {
+        footer.chars().count()
+    }
+
     #[test]
     fn picker_counts_ready_of_total() {
         let panel = SettingsPanel::new(catalog());
@@ -974,9 +1063,9 @@ mod tests {
                 "footer hides the audition key: {footer}"
             );
             assert!(
-                footer.chars().count() <= DETAIL_WIDTH,
+                footer_width(&footer) <= DETAIL_WIDTH,
                 "footer wraps at {} columns: {footer}",
-                footer.chars().count()
+                footer_width(&footer)
             );
             panel.on_key("down", "");
         }
@@ -991,8 +1080,36 @@ mod tests {
             "the picker must advertise pinning: {footer}"
         );
         assert!(
-            footer.chars().count() <= DETAIL_WIDTH,
+            footer_width(&footer) <= DETAIL_WIDTH,
             "picker footer wraps: {footer}"
+        );
+    }
+
+    #[test]
+    fn every_frame_ends_with_the_artifact_and_its_version() {
+        let want = format!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        let caption_of = |panel: &SettingsPanel| panel.lines().last().cloned().unwrap_or_default();
+        let mut panel = SettingsPanel::new(catalog());
+        panel.open(&Settings::default());
+        for _ in 0..ROWS {
+            let caption = caption_of(&panel);
+            assert_eq!(
+                caption.trim(),
+                want,
+                "the main view must end with the version it is running"
+            );
+            assert_eq!(
+                caption.chars().count(),
+                DETAIL_WIDTH,
+                "the identity row must be exactly one row: {caption:?}"
+            );
+            panel.on_key("down", "");
+        }
+        panel.on_key("enter", ""); // picker
+        assert_eq!(
+            caption_of(&panel).trim(),
+            want,
+            "the voice picker must end with the version it is running"
         );
     }
 
@@ -1039,8 +1156,9 @@ mod tests {
         panel.on_key("enter", "");
 
         // One block header (the not-downloaded block labels each row instead), the four voices,
-        // the blank line between the blocks, then the blank line and the detail rows under it.
-        let height = 1 + total + 1 + 1 + DETAIL_ROWS;
+        // the blank line between the blocks, then the blank line and the detail rows under it, and
+        // finally the caption every frame ends with.
+        let height = 1 + total + 1 + 1 + DETAIL_ROWS + CAPTION_ROWS;
         for step in 0..total * 2 {
             let lines = panel.lines();
             assert_eq!(
@@ -1055,7 +1173,7 @@ mod tests {
                 );
             }
             assert!(
-                lines[height - DETAIL_ROWS..]
+                lines[height - CAPTION_ROWS - DETAIL_ROWS..height - CAPTION_ROWS]
                     .iter()
                     .any(|l| !l.trim().is_empty()),
                 "empty detail block"
@@ -1066,9 +1184,9 @@ mod tests {
         panel.on_key("down", ""); // cursor back at 0, so this lands on the long description
         let lines = panel.lines();
         assert!(
-            lines[height - 1].trim_end().ends_with('…'),
+            lines[height - CAPTION_ROWS - 1].trim_end().ends_with('…'),
             "clipped row: {}",
-            lines[height - 1]
+            lines[height - CAPTION_ROWS - 1]
         );
     }
 
@@ -1255,19 +1373,8 @@ mod tests {
             panel.footer()
         );
 
-        // Temperature changes how a voice speaks, not its level or its rate: no audition there. Two
-        // steps down from Volume crosses the Speed row to reach it.
-        panel.on_key("down", "");
-        panel.on_key("down", "");
-        assert_eq!(
-            preview_of(panel.on_key("right", "")),
-            None,
-            "temperature edits should stay silent"
-        );
-        assert!(
-            (panel.settings().temperature - 0.35).abs() < 1e-6,
-            "temperature did not step"
-        );
+        // Temperature is not a level or a rate, so it gets its own test: see
+        // `the_temperature_row_explains_itself_while_it_is_selected`.
 
         // A change that did not happen has nothing to audition: at 100%, `+` says nothing.
         let mut ceiling = SettingsPanel::new(catalog());
@@ -1285,6 +1392,76 @@ mod tests {
         assert!(
             (ceiling.settings().volume - 1.0).abs() < 1e-6,
             "the dial clamps at 100%"
+        );
+    }
+
+    /// The Temperature row is the one row that talks while it is selected. A name-only audition
+    /// cannot show what a temperature does to a voice, so the row explains itself instead, and the
+    /// caller repeats that explanation for as long as the row holds the cursor (see
+    /// `Preview::Explain`).
+    #[test]
+    fn the_temperature_row_explains_itself_while_it_is_selected() {
+        let explaining = Preview::Explain {
+            voice: "Miles".into(),
+            text: TEMPERATURE_HINT.into(),
+        };
+        let mut panel = SettingsPanel::new(catalog());
+        panel.open(&Settings {
+            voice: "Miles".into(),
+            ..Settings::default()
+        }); // temperature 0.30
+        panel.on_key("down", ""); // Volume
+        panel.on_key("down", ""); // Speed
+
+        // Arriving on the row is itself the request; no arrow on the value is needed.
+        assert_eq!(
+            preview_of(panel.on_key("down", "")),
+            Some(explaining.clone()),
+            "the Temperature row should start explaining itself"
+        );
+        // While it is explaining, an arrow must not restart the running sentence. The next
+        // repetition is spoken at the new value (see `main.rs::live_settings`), which is what makes
+        // the repeated sentence the demonstration as well as the explanation.
+        assert_eq!(
+            preview_of(panel.on_key("right", "")),
+            None,
+            "an arrow while explaining leaves the running sentence alone"
+        );
+        assert!(
+            (panel.settings().temperature - 0.35).abs() < 1e-6,
+            "temperature did not step"
+        );
+        // Walking off the row takes the request back; nothing may keep repeating it.
+        assert_eq!(
+            preview_of(panel.on_key("down", "")),
+            Some(Preview::Silence),
+            "leaving the row must end the explanation"
+        );
+        // Arriving again asks again, so the row is never permanently silent about itself.
+        assert_eq!(
+            preview_of(panel.on_key("up", "")),
+            Some(explaining.clone()),
+            "re-selecting the row starts it again"
+        );
+        // `s` is an utterance of its own, so the row stops asking: the last message is what you hear,
+        // not the hint underneath it.
+        assert_eq!(
+            preview_of(panel.on_key("rune", "s")),
+            Some(Preview::LastMessage {
+                voice: "Miles".into()
+            }),
+            "an audition of the last message replaces the explanation"
+        );
+        assert_eq!(
+            preview_of(panel.on_key("right", "")),
+            Some(explaining),
+            "editing the row again asks again"
+        );
+        // The footer says so out loud, within the width the panel is allowed to use.
+        assert!(
+            panel.footer().contains("repeats"),
+            "footer hides the repeat: {}",
+            panel.footer()
         );
     }
 

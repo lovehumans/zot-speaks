@@ -13,6 +13,9 @@
 //!     moving the voice picker's cursor auditions that voice, `s` speaks the last message in it,
 //!     and every new request cuts off the audition it supersedes
 //!   queued requests are coalesced, so held keys audition only where the cursor lands
+//!   the Temperature row's explanation is the one preview spoken on repeat: it goes on while the row
+//!     holds the cursor, re-reads the live settings before each repetition, and ends on the next
+//!     utterance, a Silence, or a close
 //!   shutdown -> stop, shutdown_ack, exit
 //!
 //! Playback design (one contract, one code path):
@@ -21,7 +24,9 @@
 //!     the first player on the chain that is installed: `ffplay`, then `paplay` (ADR 2026-10-28).
 //!     Both read raw s16le mono on stdin, so nothing downstream knows or cares which one it got.
 //!   * Voice and temperature go through `SpeechOptions`, resolved against the locally-registered
-//!     voice catalog. Stop is cooperative: we drop the `SpeechStream` and close the sink's stdin.
+//!     voice catalog, and every utterance is synthesized from its own noise seed (`tts::SeedPlan`;
+//!     `ZOT_SPEAKS_SEED` pins the sequence) so a repeated line is a new take, not the same one.
+//!     Stop is cooperative: we drop the `SpeechStream` and close the sink's stdin.
 //!   * Writes are paced to real time so the player never buffers far ahead — low TTFB, short tail.
 
 mod cache;
@@ -68,15 +73,47 @@ const SINK_ENV: &str = "ZOT_SPEAKS_SINK";
 const STOP_GRACE: Duration = Duration::from_millis(150);
 const STOP_GRACE_TICK: Duration = Duration::from_millis(10);
 
+/// The breath between two repetitions of the same line, so a repeated explanation is a sentence you
+/// can follow rather than a stutter. Synthesis time adds to it; this is the floor.
+const LOOP_GAP: Duration = Duration::from_millis(400);
+
+/// One request to the playback thread.
 enum Cmd {
-    Play { text: String, settings: Settings },
+    /// Speak `text` once, with this exact settings snapshot.
+    Play {
+        text: String,
+        settings: Settings,
+    },
+    /// Speak `text` in `voice` and go on speaking it. The thread re-reads the live settings before
+    /// every repetition, so the value the user is looking at is the value the next one is spoken at.
+    /// This is the `/tts-settings` panel explaining the Temperature row while it is selected.
+    Loop {
+        text: String,
+        voice: String,
+    },
+    /// Cut off whatever is playing and go quiet.
     Stop,
     Exit,
 }
 
+/// What the playback thread should do next, as decided by an utterance and the queue behind it.
 enum Resume {
+    /// Go quiet: a Stop had the last word, or the line was not playable at all (no player, a player
+    /// that gave up, no audio in it). A repeat request ends here too, so nothing retries on repeat.
     Idle,
-    Play { text: String, settings: Settings },
+    /// The line ran to its end and nothing else is queued. Only a repeat request acts on this; a
+    /// one-shot utterance goes quiet.
+    Finished,
+    /// Speak this once: the newest request in the queue was a one-shot.
+    Play {
+        text: String,
+        settings: Settings,
+    },
+    /// Speak this again and again: the newest request in the queue was a repeat request.
+    Loop {
+        text: String,
+        voice: String,
+    },
     Exit,
 }
 
@@ -137,8 +174,9 @@ fn main() {
         let out = out.clone();
         let playing = playing.clone();
         let catalog = catalog.clone();
+        let current = settings.clone();
         Some(thread::spawn(move || {
-            playback_thread(out, playing, rx, catalog)
+            playback_thread(out, playing, current, rx, catalog)
         }))
     };
 
@@ -211,7 +249,7 @@ fn main() {
                 out.send(&json!({
                     "type": "register_command",
                     "name": "tts-settings",
-                    "description": "pick voice, volume, temperature and auto-speak; the voice picker previews each voice as you browse, volume changes audition the current voice, `f` pins favorites, and the arrows on Auto speak step it off -> this project -> every project, where speaking the last agent message at the end of a turn is what changes",
+                    "description": "pick voice, volume, speed, temperature and auto-speak; the voice picker previews each voice as you browse, volume and speed changes audition the current voice, the Temperature row explains itself out loud while it is selected, `f` pins favorites, and the arrows on Auto speak step it off -> this project -> every project, where speaking the last agent message at the end of a turn is what changes",
                 }));
                 out.send(
                     &json!({"type": "subscribe", "events": ["assistant_message", "turn_end"]}),
@@ -445,9 +483,10 @@ fn auto_speak(
 }
 
 /// Make a panel key press audible: a voice introducing itself, the last agent message in the
-/// highlighted voice, or silence (the cursor landed on a voice whose embedding is not cached, so
-/// the audition we are leaving must not keep talking). Previews share the playback queue with
-/// `/tts`, which is what makes a new one cut off the previous one rather than queue behind it.
+/// highlighted voice, a line the panel wants repeated, or silence (the cursor landed on a voice whose
+/// embedding is not cached, so the audition we are leaving must not keep talking). Previews share the
+/// playback queue with `/tts`, which is what makes a new one cut off the previous one rather than
+/// queue behind it.
 fn speak_preview(
     messages: &Arc<Mutex<Messages>>,
     tx: &Sender<Cmd>,
@@ -458,6 +497,13 @@ fn speak_preview(
     let (text, voice) = match preview {
         Preview::Voice { voice, text } => (text, voice),
         Preview::LastMessage { voice } => (messages.lock().unwrap().newest.clone(), voice),
+        Preview::Explain { voice, text } => {
+            // Only the voice travels with a repeated line: the thread reads the rest of the settings
+            // again before each repetition, which is how a temperature you just stepped is heard in
+            // the next sentence.
+            let _ = tx.send(Cmd::Loop { text, voice });
+            return;
+        }
         Preview::Silence => {
             let _ = tx.send(Cmd::Stop);
             return;
@@ -477,11 +523,12 @@ fn speak_preview(
 }
 
 /// Own the `Synth` on a dedicated thread: load it once (in the background, while the protocol is
-/// already live), then serve Play/Stop/Exit commands. A Play enqueued during warmup sits in the
-/// channel until we start reading.
+/// already live), then serve Play/Loop/Stop/Exit commands. A request enqueued during warmup sits in
+/// the channel until we start reading.
 fn playback_thread(
     out: Arc<Out>,
     playing: Arc<AtomicBool>,
+    current: Arc<Mutex<Settings>>,
     rx: Receiver<Cmd>,
     catalog: Vec<VoiceInfo>,
 ) {
@@ -498,48 +545,95 @@ fn playback_thread(
         &format!("zot-speaks: ready ({} Hz).", synth.sample_rate()),
     );
 
+    // One noise seed per utterance, drawn as the utterance starts. With ptts' own default the same
+    // sentence would come back as the identical take every time it is spoken.
+    let seeds = tts::SeedPlan::from_env();
+
     loop {
-        match rx.recv() {
-            Ok(Cmd::Play { text, settings }) => {
-                // Coalesce before synthesizing as well as after: while we are busy the user may
-                // already have moved on, and the voices they walked past are not worth hearing.
-                let mut pending = match latest_of(&rx, text, settings) {
-                    Resume::Play { text, settings } => Some((text, settings)),
-                    Resume::Idle => None, // a Stop had the last word
-                    Resume::Exit => return,
-                };
-                while let Some((text, settings)) = pending.take() {
-                    match play_one(&synth, &out, &playing, &rx, &text, &settings) {
-                        Resume::Play { text, settings } => match latest_of(&rx, text, settings) {
-                            Resume::Play { text, settings } => pending = Some((text, settings)),
-                            Resume::Idle => break, // a Stop was the last word: go quiet
-                            Resume::Exit => return,
-                        },
-                        Resume::Exit => return,
-                        Resume::Idle => break,
-                    }
-                }
-            }
-            Ok(Cmd::Stop) => {} // idle: nothing to stop
+        let request = match rx.recv() {
+            Ok(Cmd::Play { text, settings }) => Resume::Play { text, settings },
+            Ok(Cmd::Loop { text, voice }) => Resume::Loop { text, voice },
+            Ok(Cmd::Stop) => continue, // idle: nothing to stop
             Ok(Cmd::Exit) => return,
             Err(_) => return, // all senders dropped
+        };
+        if !serve(&synth, &seeds, &out, &playing, &current, &rx, request) {
+            return;
         }
     }
 }
 
-/// A request superseded mid-stream is usually a held arrow key in the picker: one preview per
-/// step, all of them now pointless. Drain the queue and keep only the newest Play, so the voice
-/// under the cursor is the one you hear instead of a backlog of voices you walked past.
-fn latest_of(rx: &Receiver<Cmd>, text: String, settings: Settings) -> Resume {
-    let mut latest = Resume::Play { text, settings };
+/// Play what was asked for, and then whatever the queue asks for, until something says otherwise.
+/// A `Resume::Loop` is what makes this a repeating utterance: when a repetition ends with nothing
+/// else queued, the same line is spoken again from the live settings, so the temperature on screen is
+/// the temperature you hear in the next sentence. Anything else is one utterance. The coalescing that
+/// used to live here is now `coalesce`, applied before every utterance rather than only around the
+/// ones a held key produced.
+///
+/// Returns false when the thread should exit.
+fn serve(
+    synth: &Synth,
+    seeds: &tts::SeedPlan,
+    out: &Arc<Out>,
+    playing: &Arc<AtomicBool>,
+    current: &Arc<Mutex<Settings>>,
+    rx: &Receiver<Cmd>,
+    request: Resume,
+) -> bool {
+    let mut next = request;
+    loop {
+        let (text, settings, repeat) = match coalesce(rx, next) {
+            Resume::Play { text, settings } => (text, settings, false),
+            Resume::Loop { text, voice } => (text, live_settings(current, &voice), true),
+            Resume::Idle | Resume::Finished => return true, // nothing left to say
+            Resume::Exit => return false,
+        };
+        match play_one(synth, seeds, out, playing, rx, &text, &settings) {
+            // Stopped, or nothing playable: go quiet.
+            Resume::Idle => return true,
+            Resume::Exit => return false,
+            // The line said its piece and nothing else is queued. That is the one moment a repeat
+            // repeats, and a breath comes first so it lands as a sentence and not a stutter.
+            Resume::Finished if repeat => {
+                thread::sleep(LOOP_GAP);
+                next = Resume::Loop {
+                    text,
+                    voice: settings.voice.clone(),
+                };
+            }
+            Resume::Finished => return true,
+            // Cut short by a newer request, which decides what comes next, repeating included.
+            Resume::Play { text, settings } => next = Resume::Play { text, settings },
+            Resume::Loop { text, voice } => next = Resume::Loop { text, voice },
+        }
+    }
+}
+
+/// A request superseded mid-stream is usually a held arrow key in the picker: one preview per step,
+/// all of them now pointless. Drain the queue and keep only the newest request, so the voice under
+/// the cursor is the one you hear instead of a backlog of voices you walked past. A drain that found
+/// nothing hands back the request it was given, which is what makes a repeat keep repeating.
+fn coalesce(rx: &Receiver<Cmd>, request: Resume) -> Resume {
+    let mut latest = request;
     loop {
         match rx.try_recv() {
             Ok(Cmd::Play { text, settings }) => latest = Resume::Play { text, settings },
+            Ok(Cmd::Loop { text, voice }) => latest = Resume::Loop { text, voice },
             Ok(Cmd::Stop) => latest = Resume::Idle,
             Ok(Cmd::Exit) => return Resume::Exit,
             Err(TryRecvError::Empty) => return latest,
             Err(TryRecvError::Disconnected) => return Resume::Exit,
         }
+    }
+}
+
+/// The settings a repetition is spoken at: the shared live settings — so the value on screen is the
+/// value you hear — carried in the voice the explanation was started in, which is the voice the user
+/// is listening to.
+fn live_settings(current: &Arc<Mutex<Settings>>, voice: &str) -> Settings {
+    Settings {
+        voice: voice.to_string(),
+        ..current.lock().unwrap().clone()
     }
 }
 
@@ -709,16 +803,19 @@ fn report_player_error(out: &Out, player: &str, reason: &str) {
 }
 
 /// Synthesize + stream one text under the given settings, watching for a cooperative Stop or a
-/// superseding Play between PCM chunks. Returns what the caller should do next.
+/// superseding Play between PCM chunks. `seeds` is asked for one seed per utterance, which is what
+/// makes a repeated line a new take rather than the same one replayed. Returns what the caller
+/// should do next.
 fn play_one(
     synth: &Synth,
+    seeds: &tts::SeedPlan,
     out: &Arc<Out>,
     playing: &AtomicBool,
     rx: &Receiver<Cmd>,
     text: &str,
     settings: &Settings,
 ) -> Resume {
-    let (options, used_voice) = tts::build_options(synth, settings);
+    let (options, used_voice) = tts::build_options(synth, settings, seeds.next());
     if !settings.voice.is_empty() && used_voice.is_none() {
         out.notify(
             "warn",
@@ -798,7 +895,9 @@ fn play_one(
     playing.store(true, Ordering::SeqCst);
     let started = Instant::now();
     let mut samples_written: u64 = 0;
-    let mut resume = Resume::Idle;
+    // An utterance that reaches the end of its stream has finished; that is what a repeat request
+    // waits for. A Stop, a player that gave up, or a line with no audio in it says `Idle` instead.
+    let mut resume = Resume::Finished;
     // Audio the user has moved on from: drives the bounded drain at the teardown below.
     let mut cut_short = false;
     let mut buffer: Vec<u8> = Vec::new();
@@ -836,7 +935,7 @@ fn play_one(
             }
         }
 
-        // Cooperative control point: between chunks, honor Stop / new Play / Exit.
+        // Cooperative control point: between chunks, honor Stop / new Play / new Loop / Exit.
         match rx.try_recv() {
             Ok(Cmd::Stop) => {
                 resume = Resume::Idle;
@@ -845,6 +944,14 @@ fn play_one(
             }
             Ok(Cmd::Play { text, settings }) => {
                 resume = Resume::Play { text, settings };
+                cut_short = true;
+                break;
+            }
+            Ok(Cmd::Loop { text, voice }) => {
+                // The panel wants this line said on repeat. Cutting this utterance short is right
+                // even when it is that very line playing: the panel only asks for a repeat when it
+                // has stopped asking, so what follows is the same sentence at a new value.
+                resume = Resume::Loop { text, voice };
                 cut_short = true;
                 break;
             }
@@ -888,7 +995,14 @@ fn play_one(
         }
         if let Some(reason) = player_failure_reason(exit_ok, &stderr) {
             report_player_error(out, player, &reason);
+            // A player that gave up is not worth repeating after.
+            resume = Resume::Idle;
         }
+    }
+    // A line that produced no audio at all is nothing to repeat either; otherwise a broken player
+    // would make an explanation retry forever.
+    if samples_written == 0 {
+        resume = Resume::Idle;
     }
     resume
 }
@@ -910,10 +1024,12 @@ fn apply_ptts_env() {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_final_stop, no_player_hint, player_args, player_chain, player_failure_reason,
-        speed_unhonored_note, tempo_changeable, Messages,
+        coalesce, is_final_stop, live_settings, no_player_hint, player_args, player_chain,
+        player_failure_reason, speed_unhonored_note, tempo_changeable, Cmd, Messages, Resume,
     };
-    use crate::settings::{Speed, DEFAULT_SPEED, SPEED_MAX, SPEED_MIN};
+    use crate::settings::{Settings, Speed, DEFAULT_SPEED, SPEED_MAX, SPEED_MIN};
+    use std::sync::mpsc::{self, Sender};
+    use std::sync::{Arc, Mutex};
 
     /// Auto-speak hangs on this gate, so it is worth naming the values out loud. The host's own
     /// name for a finished answer (`end`, what zot puts on the wire) and the provider's name the
@@ -1098,6 +1214,75 @@ mod tests {
         assert_eq!(
             player_failure_reason(false, "").as_deref(),
             Some("nothing on stderr")
+        );
+    }
+
+    /// A repeat repeats because a drain that found nothing hands back the request it was given: the
+    /// queue is the only thing that ends it. So the queue's three ways of ending one have to win in
+    /// the right order — a Stop, a newer request, an Exit.
+    #[test]
+    fn coalescing_repeats_until_the_queue_says_otherwise() {
+        let repeat = || Resume::Loop {
+            text: "one line".to_string(),
+            voice: "Miles".to_string(),
+        };
+        let (tx, rx) = mpsc::channel();
+        assert!(
+            matches!(coalesce(&rx, repeat()), Resume::Loop { .. }),
+            "an empty drain must hand the repeat back, not drop it"
+        );
+        tx.send(Cmd::Stop).unwrap();
+        assert!(
+            matches!(coalesce(&rx, repeat()), Resume::Idle),
+            "a Stop ends a repeat"
+        );
+        tx.send(Cmd::Loop {
+            text: "another line".to_string(),
+            voice: "Zoey".to_string(),
+        })
+        .unwrap();
+        match coalesce(&rx, repeat()) {
+            Resume::Loop { text, voice } => {
+                assert_eq!((text.as_str(), voice.as_str()), ("another line", "Zoey"))
+            }
+            _ => panic!("the newest request should win over the one it supersedes"),
+        }
+        tx.send(Cmd::Exit).unwrap();
+        assert!(
+            matches!(coalesce(&rx, repeat()), Resume::Exit),
+            "exit outranks a repeat"
+        );
+        // The drain itself is what the thread blocks on between utterances, so a sender that is
+        // still alive must never look like an ended conversation.
+        let held: Sender<Cmd> = tx.clone();
+        assert!(matches!(coalesce(&rx, repeat()), Resume::Loop { .. }));
+        drop(held);
+        drop(tx);
+        assert!(
+            matches!(coalesce(&rx, repeat()), Resume::Exit),
+            "a closed queue is an exit"
+        );
+    }
+
+    /// Every repetition is spoken at the settings the panel is showing, but in the voice the
+    /// explanation started in: the row the user is on is the value they are hearing, and the voice
+    /// they picked is the one they are listening to.
+    #[test]
+    fn a_repetition_follows_the_live_settings_but_keeps_its_voice() {
+        let live = Arc::new(Mutex::new(Settings {
+            temperature: 0.70,
+            volume: 0.40,
+            ..Settings::default()
+        }));
+        let spoken = live_settings(&live, "Zoey");
+        assert_eq!(spoken.voice, "Zoey", "a repeat keeps its voice");
+        assert!(
+            (spoken.temperature - 0.70).abs() < 1e-6,
+            "a repeat hears the temperature on screen"
+        );
+        assert!(
+            (spoken.volume - 0.40).abs() < 1e-6,
+            "a repeat follows the dial as it moves"
         );
     }
 }

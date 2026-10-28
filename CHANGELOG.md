@@ -6,6 +6,28 @@ published CI feeds that section to `gh release create --notes-file`. A Release's
 afterwards; a published tag cannot — which is why the notes live in a tracked file instead of in the
 tag message.
 
+## v1.8.1 — The Temperature row says what it does
+
+- The **Temperature** row now speaks while it is the selected row, in the voice you picked:
+  *Temperature adds variety to how a sentence is pronounced.* It starts when the cursor arrives and
+  keeps repeating for as long as the row holds the cursor — the bound is the selection, not a count.
+- An arrow on the value does not restart the sentence already running. The **next** repetition is
+  synthesized at the value you just stepped, so the repeated sentence is also the demonstration: the
+  same line at `0.30`, then at `0.70`.
+- It ends when you leave the row, close the panel, ask for `/tts stop`, or say anything else (`s`,
+  another row's audition, an auto-spoken answer). Leaving and returning starts it again.
+- Only an utterance that really produced audio is repeated, so a missing or failing player cannot
+  turn an explanation into an endless retry.
+- The `/tts-settings` panel now names what you are running: its last row is `zot-speaks v1.8.1`,
+  right-aligned under the settings and the voice detail, so "did the update land?" is answerable from
+  the panel.
+
+- The **noise seed varies per utterance**: every request is synthesized from its own seed, counting
+  up from a base drawn when the extension starts, so the repeated explanation, a re-run `/tts` and an
+  auto-spoken answer are each a new take rather than the same audio replayed. `ZOT_SPEAKS_SEED=<n>`
+  pins that base, which replays a session's utterances in order; at temperature `0.0` there is no
+  noise to vary, so repeats stay identical there by design.
+
 ## v1.8.0 — Speak at a chosen speed
 
 - New **Speed** setting: `0.5x` to `2.0x` in `0.1` steps, default `1.0x`. It sits on the
