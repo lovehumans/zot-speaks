@@ -1,9 +1,9 @@
 {
   "name": "zot-speaks",
-  "version": "1.7.15",
+  "version": "1.8.0",
   "exec": "./zot-speaks",
   "args": [],
   "language": "rust",
-  "description": "Speak the last agent message aloud via Gradium Phonon (/tts); /tts-settings picks voice (English catalog for phonon-31m-en), a 0-100% volume dial, temperature and auto speak (off · this project · every project, cycled with the arrows: it reads the last agent message aloud when a turn ends), previews each voice as you browse, and pins favorite voices with f. Local-only: reads the Hugging Face cache, never downloads at runtime.",
+  "description": "Speak the last agent message aloud via Gradium Phonon (/tts); /tts-settings picks voice (English catalog for phonon-31m-en), a 0-100% volume dial, a 0.5x-2.0x speed ladder, temperature and auto speak (off · this project · every project, cycled with the arrows: it reads the last agent message aloud when a turn ends), previews each voice as you browse, and pins favorite voices with f. Local-only: reads the Hugging Face cache, never downloads at runtime.",
   "enabled": true
 }

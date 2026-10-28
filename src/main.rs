@@ -34,7 +34,7 @@ mod wire;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -45,7 +45,7 @@ use ptts::synth::Synth;
 use serde_json::{json, Value};
 
 use panel::{KeyOutcome, Preview, SettingsPanel, PANEL_ID};
-use settings::Settings;
+use settings::{Settings, Speed};
 use voices::VoiceInfo;
 use wire::Out;
 
@@ -562,8 +562,10 @@ fn player_chain(pin: Option<&str>) -> Vec<&'static str> {
 }
 
 /// How each player is told the format: mono s16le on stdin at this rate. Everything after the
-/// spawn is shared, because the format is the whole contract.
-fn player_args(player: &str, rate: u32) -> Vec<String> {
+/// spawn is shared, because the format is the whole contract. Only a player that can change tempo
+/// (see `speakable_speed`) is ever handed a speed, which is why the `paplay` arm has no tempo flag
+/// at all — the natural rate is its only rate.
+fn player_args(player: &str, rate: u32, speed: Speed) -> Vec<String> {
     let rate = rate.to_string();
     match player {
         "paplay" => vec![
@@ -573,20 +575,52 @@ fn player_args(player: &str, rate: u32) -> Vec<String> {
             "--rate".into(),
             rate,
         ],
-        _ => vec![
-            "-nodisp".into(),
-            "-autoexit".into(),
-            "-loglevel".into(),
-            "error".into(),
-            "-f".into(),
-            "s16le".into(),
-            "-ar".into(),
-            rate,
-            "-ch_layout".into(), // not `-ac 1`: removed in newer ffmpeg
-            "mono".into(),
-            "-".into(),
-        ],
+        _ => {
+            let mut args = vec![
+                "-nodisp".into(),
+                "-autoexit".into(),
+                "-loglevel".into(),
+                "error".into(),
+                "-f".into(),
+                "s16le".into(),
+                "-ar".into(),
+                rate,
+                "-ch_layout".into(), // not `-ac 1`: removed in newer ffmpeg
+                "mono".into(),
+            ];
+            // `atempo` changes the rate without changing the pitch. It has to sit before the `-`,
+            // because ffmpeg reads it as an option on the input that follows it, and the input is
+            // the pipe.
+            if let Some(tempo) = speed.tempo_arg() {
+                args.push("-af".into());
+                args.push(format!("atempo={tempo}"));
+            }
+            args.push("-".into());
+            args
+        }
     }
+}
+
+/// Whether this player can change the rate of what it is fed without changing the pitch. `ffplay`
+/// gets ffmpeg's `atempo` filter; `paplay` has no such knob in its flags, so the natural rate is its
+/// only rate. The caller feeds the answer to `Speed::speakable_when`, which is what decides whether
+/// the Speed setting means anything on this machine.
+fn tempo_changeable(player: &str) -> bool {
+    player == "ffplay"
+}
+
+static SPEED_UNHONORED: AtomicBool = AtomicBool::new(false);
+
+/// What we say, once per session, when the player that answered cannot speak at the speed the
+/// settings asked for. Said out loud because the Speed row would otherwise read as a promise; said
+/// once because repeating it on every utterance and every panel audition would bury the setting.
+fn speed_unhonored_note(player: &str, asked: Speed, spoken: Speed) -> String {
+    format!(
+        "zot-speaks: {player} cannot change speed, so it speaks at {} not {} — ffplay can, so \
+         {SINK_ENV}=ffplay (or no pin at all) is what makes the Speed setting mean something",
+        spoken.label(),
+        asked.label(),
+    )
 }
 
 /// Why nothing could be started — the three shapes are different problems and must not share one
@@ -618,21 +652,50 @@ fn no_player(out: &Out, pin: Option<&str>) {
     out.notify("error", &format!("zot-speaks: {}", no_player_hint(pin)));
 }
 
-/// A player that gave up on its own says why on stderr, and forwarding that is the difference
-/// between "PulseAudio is down" and a `/tts` that looked like it worked. Both players write little
-/// (`-loglevel error`), so reading after stdin closed cannot block on a full pipe.
-fn report_player_error(out: &Out, child: &mut Child, player: &str) {
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
+/// Lines a player prints when it could not play at all. Measured with ffplay n9.0.2: an unopenable
+/// audio device, an unreadable input and an unknown filter each exit with status **0** (only an
+/// unrecognised argument exits 1), so a fatal `ffplay` run can look exactly like a successful one
+/// and these lines are the only report it gives.
+///
+/// Deliberately narrow, because a healthy run is not quiet either: pipewire's `scandir … Permission
+/// denied` and the ALSA library's complaints arrive on the same stderr and must not read as failure.
+const FATAL_PLAYER_LINES: [&str; 4] = [
+    "failed to open",
+    "audio open failed",
+    "no such filter",
+    "error processing filtergraph",
+];
+
+/// Why a player's run ended badly, in that player's own words, or None when it ended well.
+///
+/// `paplay` reports failure through its exit status. `ffplay` does not (see `FATAL_PLAYER_LINES`),
+/// so a fatal line counts whatever the exit status claims; a run that failed without naming a reason
+/// still gets its first stderr line, which is the best report available.
+/// Pure, so both shapes are testable without a subprocess.
+fn player_failure_reason(exit_ok: bool, stderr: &str) -> Option<String> {
+    if let Some(line) = stderr.lines().map(str::trim).find(|line| {
+        let lower = line.to_lowercase();
+        FATAL_PLAYER_LINES
+            .iter()
+            .any(|marker| lower.contains(marker))
+    }) {
+        return Some(line.to_owned());
     }
-    let reason = stderr
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("nothing on stderr");
-    // Installed-but-broken (`paplay` with no sound server) is not the same as absent, so name the
-    // other player the user can pin: a dead PulseAudio should not read as a dead /tts.
+    (!exit_ok).then(|| {
+        stderr
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("nothing on stderr")
+            .to_owned()
+    })
+}
+
+/// Tell the user what the player said. Both players write little (`-loglevel error`), and the reason
+/// has already been picked out of whatever they wrote. Installed-but-broken (`paplay` with no sound
+/// server, `ffplay` with no audio device) is not the same as absent, so the note names the other
+/// player the user can pin: a dead sound server should not read as a dead `/tts`.
+fn report_player_error(out: &Out, player: &str, reason: &str) {
     let alternative = PLAYERS
         .iter()
         .copied()
@@ -677,19 +740,32 @@ fn play_one(
     // which one it is, because they all eat the same PCM on stdin. A player that starts and then
     // dies is not a spawn failure — it is reported where it actually shows up, at the teardown.
     let pin = std::env::var(SINK_ENV).ok().filter(|name| !name.is_empty());
-    let Some((player, mut child)) = player_chain(pin.as_deref()).iter().find_map(|&player| {
-        Command::new(player)
-            .args(player_args(player, rate))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .ok()
-            .map(|child| (player, child))
-    }) else {
+    // Each candidate is asked what rate it can actually speak at, so the player that answers decides
+    // both its own argv and the pacing below. A pin that names a player without a tempo knob speaks
+    // at the natural rate and says so once.
+    let asked_speed = settings.speed;
+    let Some((player, spoken_speed, mut child)) =
+        player_chain(pin.as_deref()).iter().find_map(|&player| {
+            let speed = asked_speed.speakable_when(tempo_changeable(player));
+            Command::new(player)
+                .args(player_args(player, rate, speed))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .ok()
+                .map(|child| (player, speed, child))
+        })
+    else {
         no_player(out, pin.as_deref());
         return Resume::Idle;
     };
+    if spoken_speed != asked_speed && !SPEED_UNHONORED.swap(true, Ordering::Relaxed) {
+        out.notify(
+            "warn",
+            &speed_unhonored_note(player, asked_speed, spoken_speed),
+        );
+    }
     let mut sink = match child.stdin.take() {
         Some(sink) => sink,
         None => {
@@ -706,14 +782,19 @@ fn play_one(
     out.notify(
         "info",
         &format!(
-            "zot-speaks: speaking as {} at temp {:.2}, vol {:.0}% through {player}",
+            "zot-speaks: speaking as {} at temp {:.2}, vol {:.0}%, speed {} through {player}",
             used_voice.clone().unwrap_or_else(|| "default".to_string()),
             options.temperature.unwrap_or(0.0),
             settings.volume * 100.0,
+            spoken_speed.label(),
         ),
     );
 
     let gain = settings.gain();
+    // The pacing clock follows the player, not the setting: a player handed the tempo filter drains
+    // what we write that much faster than natural time, and feeding it at natural time would starve
+    // it. At 1.0x this is the clock it has always been.
+    let tempo = spoken_speed.factor();
     playing.store(true, Ordering::SeqCst);
     let started = Instant::now();
     let mut samples_written: u64 = 0;
@@ -744,7 +825,7 @@ fn play_one(
 
                 // Pace to real time so the sink buffer stays small: this is what makes both
                 // TTFB low and the stop tail short.
-                let audio = Duration::from_secs_f64(samples_written as f64 / rate as f64);
+                let audio = Duration::from_secs_f64(samples_written as f64 / (rate as f64 * tempo));
                 if audio > started.elapsed() + PLAY_LEAD {
                     thread::sleep(audio - started.elapsed() - PLAY_LEAD);
                 }
@@ -796,8 +877,18 @@ fn play_one(
         let _ = child.kill();
     }
     // A player that gave up on its own has something to say; one we killed on purpose does not.
-    if !killed && matches!(child.wait(), Ok(status) if !status.success()) {
-        report_player_error(out, &mut child, player);
+    // stderr is read whatever the exit status says, because `ffplay` exits 0 even when it managed to
+    // play nothing (see `FATAL_PLAYER_LINES`), and stdin is already closed, so reading it to EOF
+    // after the child is reaped cannot block.
+    if !killed {
+        let exit_ok = matches!(child.wait(), Ok(status) if status.success());
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        if let Some(reason) = player_failure_reason(exit_ok, &stderr) {
+            report_player_error(out, player, &reason);
+        }
     }
     resume
 }
@@ -818,7 +909,11 @@ fn apply_ptts_env() {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_final_stop, no_player_hint, player_args, player_chain, Messages};
+    use super::{
+        is_final_stop, no_player_hint, player_args, player_chain, player_failure_reason,
+        speed_unhonored_note, tempo_changeable, Messages,
+    };
+    use crate::settings::{Speed, DEFAULT_SPEED, SPEED_MAX, SPEED_MIN};
 
     /// Auto-speak hangs on this gate, so it is worth naming the values out loud. The host's own
     /// name for a finished answer (`end`, what zot puts on the wire) and the provider's name the
@@ -894,15 +989,16 @@ mod tests {
     }
 
     /// The whole point of the chain is that every player eats the same PCM, so one write loop and
-    /// one stop rule serve them all (ADR 2026-10-27).
+    /// one stop rule serve them all (ADR 2026-10-27). At the natural speed neither gets a word about
+    /// tempo: the contract is the format, and `1.0x` is the rate both default to.
     #[test]
     fn every_player_is_told_the_exact_pcm_contract() {
         assert_eq!(
-            player_args("paplay", 24000),
+            player_args("paplay", 24000, DEFAULT_SPEED),
             ["--raw", "--format=s16le", "--channels=1", "--rate", "24000"]
         );
         assert_eq!(
-            player_args("ffplay", 22050),
+            player_args("ffplay", 22050, DEFAULT_SPEED),
             [
                 "-nodisp",
                 "-autoexit",
@@ -916,6 +1012,92 @@ mod tests {
                 "mono",
                 "-",
             ]
+        );
+    }
+
+    /// The speed reaches the player that can honor it, as a tempo filter sitting on the input it is
+    /// about to read. The exact numbers matter because `0.5x` and `2.0x` are the ends of the ladder
+    /// and a truncated or rounded filter would speak at a rate the panel never offered.
+    #[test]
+    fn the_speed_rides_on_the_ffplay_command_as_atempo() {
+        for (tenths, tempo) in [
+            (SPEED_MIN.tenths(), "0.5"),
+            (12, "1.2"),
+            (SPEED_MAX.tenths(), "2.0"),
+        ] {
+            let args = player_args("ffplay", 24000, Speed::from_tenths(tenths));
+            let joined = args.join(" ");
+            assert!(
+                joined.contains(&format!("-af atempo={tempo}")),
+                "{joined} does not ask ffplay for {tempo}"
+            );
+            assert_eq!(
+                args.last().map(String::as_str),
+                Some("-"),
+                "the filter must precede the pipe it applies to: {joined}"
+            );
+        }
+    }
+
+    /// A pinned player with no tempo knob is not a reason to refuse the request: it speaks at the
+    /// natural rate, and the Speed row has to say so in the same breath. This is `paplay` on any
+    /// platform, and the whole of what a user can expect from `ZOT_SPEAKS_SINK=paplay`.
+    #[test]
+    fn a_player_without_tempo_is_silent_about_speed_rather_than_loud_about_nothing() {
+        assert!(!tempo_changeable("paplay"));
+        assert!(tempo_changeable("ffplay"));
+        assert_eq!(
+            player_args("paplay", 24000, Speed::from_tenths(SPEED_MAX.tenths())),
+            ["--raw", "--format=s16le", "--channels=1", "--rate", "24000"]
+        );
+        let note = speed_unhonored_note(
+            "paplay",
+            Speed::from_tenths(15),
+            Speed::from_tenths(DEFAULT_SPEED.tenths()),
+        );
+        assert!(note.contains("paplay cannot change speed"));
+        assert!(note.contains("1.0x not 1.5x"));
+        assert!(note.contains("ZOT_SPEAKS_SINK=ffplay"));
+    }
+
+    /// A failed `ffplay` exits 0. Measured with n9.0.2: no audio device, an unreadable input and an
+    /// unknown filter all exit successfully — only an unrecognised argument exits 1 — so its exit
+    /// status cannot be the report and its own words have to be. The warnings that accompany a run
+    /// that really did play must not turn into errors the user has to read.
+    #[test]
+    fn a_player_that_exits_well_after_playing_nothing_still_says_so() {
+        // Verbatim shape of `ffplay` on this box with no usable audio device.
+        let dead_device =
+            "[W] pw.conf | scandir /etc/pipewire/client.conf.d failed: Permission denied\n\
+             ALSA lib pcm.c:2722:(snd_pcm_open_noupdate) [error.pcm] Unknown PCM default\n\
+             No more combinations to try, audio open failed\n\
+             Failed to open file 'fd:' or configure filtergraph";
+        assert_eq!(
+            player_failure_reason(true, dead_device).as_deref(),
+            Some("No more combinations to try, audio open failed"),
+            "status 0 is not success for this player"
+        );
+        let bad_filter =
+            "[AVFilterGraph @ 0x7f30] Error processing filtergraph: Filter not found\n\
+             Failed to open file 'fd:' or configure filtergraph";
+        assert_eq!(
+            player_failure_reason(true, bad_filter).as_deref(),
+            Some("[AVFilterGraph @ 0x7f30] Error processing filtergraph: Filter not found"),
+        );
+        // The same noise from a run that played everything: not a failure.
+        let healthy =
+            "[W] pw.conf | scandir /etc/pipewire/client.conf.d failed: Permission denied\n\
+             ALSA lib pcm.c:2722:(snd_pcm_open_noupdate) [error.pcm] Unknown PCM default";
+        assert_eq!(player_failure_reason(true, healthy), None);
+        assert_eq!(player_failure_reason(true, ""), None);
+        // `paplay` does report through its status, with or without a line to say why.
+        assert_eq!(
+            player_failure_reason(false, "Connection failure: Connection refused").as_deref(),
+            Some("Connection failure: Connection refused"),
+        );
+        assert_eq!(
+            player_failure_reason(false, "").as_deref(),
+            Some("nothing on stderr")
         );
     }
 }

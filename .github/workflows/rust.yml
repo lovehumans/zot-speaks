@@ -64,13 +64,51 @@ jobs:
       run: |
         install -m 0755 target/release/zot-speaks zot-speaks
         sha256sum zot-speaks extension.json > SHA256SUMS
+    # The text of the Release: the `## v<version>` section of CHANGELOG.md, which is the file
+    # dev/publish.sh refuses to publish without. Falling back to build provenance keeps an old tag or
+    # a hand-made tag releasable rather than failing the job.
+    - name: Write the release notes from CHANGELOG.md
+      if: steps.tag.outputs.tag != ''
+      id: notes
+      run: |
+        tag="${{ steps.tag.outputs.tag }}"
+        if [ -f CHANGELOG.md ]; then
+          # Trailing blank lines trimmed. The tag is compared as a whole field so `v1.7.1` cannot
+          # match the section belonging to `v1.7.10`.
+          awk -v tag="$tag" '
+            /^## / { keep = ($2 == tag); next }
+            keep   { lines[++n] = $0 }
+            END {
+              while (n > 0 && lines[n] ~ /^[[:space:]]*$/) n--
+              first = 1
+              while (first <= n && lines[first] ~ /^[[:space:]]*$/) first++
+              for (i = first; i <= n; i++) print lines[i]
+            }
+          ' CHANGELOG.md > notes.md
+        else
+          : > notes.md
+        fi
+        if [ -s notes.md ]; then
+          echo "found=yes" >> "$GITHUB_OUTPUT"
+          echo "notes for $tag: $(wc -l < notes.md) lines from CHANGELOG.md"
+        else
+          echo "found=no" >> "$GITHUB_OUTPUT"
+          echo "no CHANGELOG.md section for $tag; falling back to build provenance"
+          printf 'Built with cargo build --release on ubuntu-latest by GitHub Actions.\n' > notes.md
+        fi
     - name: Attach them to the tag's release
       if: steps.tag.outputs.tag != ''
       run: |
         tag="${{ steps.tag.outputs.tag }}"
-        printf 'Built with cargo build --release on ubuntu-latest by GitHub Actions.\n\n%s\n' "$(cat SHA256SUMS)" > NOTES
+        {
+          cat notes.md
+          printf '\nAssets, verified by `just update-release`:\n\n%s\n' "$(cat SHA256SUMS)"
+        } > NOTES
         if gh release view "$tag" >/dev/null 2>&1; then
-          echo "release $tag already exists; refreshing its assets instead of failing"
+          echo "release $tag already exists; refreshing its assets"
+          if [ "${{ steps.notes.outputs.found }}" = yes ]; then
+            gh release edit "$tag" --notes-file NOTES
+          fi
         else
           gh release create "$tag" --title "zot-speaks $tag" --notes-file NOTES
         fi

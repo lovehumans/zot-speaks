@@ -37,11 +37,12 @@ installs anything on a Mac: `install-release` and `update-release` fetch the Lin
 | player | command |
 |---|---|
 | `paplay` | `paplay --raw --format=s16le --channels=1 --rate <rate>` |
-| `ffplay` | `ffplay -nodisp -autoexit -loglevel error -f s16le -ar <rate> -ch_layout mono -` |
+| `ffplay` | `ffplay -nodisp -autoexit -loglevel error -f s16le -ar <rate> -ch_layout mono [-af atempo=<speed>] -` |
 
 One raw PCM stream, one write loop, one stop path, no `cfg!`: the first player found on `PATH` is
 used, `ffplay` before `paplay` (ADR 2026-10-28). On a Mac that means `ffplay`, and the notification
-says which one it is: `zot-speaks: speaking as Alice at temp 0.7, vol 100% through ffplay`.
+says which one it is and at what rate: `zot-speaks: speaking as Alice at temp 0.7, vol 100%,
+speed 1.2x through ffplay`.
 
 Override it with `ZOT_SPEAKS_SINK=paplay|ffplay` (empty or unset picks automatically; an unknown
 name is an error, not a silent fallback). `paplay` is not something a Mac has out of the box — the
@@ -53,13 +54,21 @@ about raw-PCM input parameters, not about that flag.
 the whole utterance to a temp file before you hear anything. `ffplay` reads stdin and starts as soon
 as bytes arrive.
 
-Playback speed is still a macOS-only idea (`ffplay` supports `atempo`, `paplay` has no equivalent),
-and it stays unimplemented until it is measured on a Mac.
+The **Speed** setting is a player request, not a model one: Phonon synthesizes at its own 24 kHz
+natural rate and `ffplay` is asked for the tempo (`-af atempo=1.2`), which stretches the time without
+shifting the pitch. On a Mac that always means something, because `ffplay` is the only player a Mac
+has here. `paplay` has no tempo flag: pin it (`ZOT_SPEAKS_SINK=paplay`) and every utterance is spoken
+at `1.0x`, with one notice per session saying so and naming `ZOT_SPEAKS_SINK=ffplay` as the pin that
+would honor the dial.
 
-If `ffplay` starts and then gives up, the first line of its stderr is reported as an error
+If `ffplay` starts and then gives up, its own words are reported as an error
 (`zot-speaks: ffplay stopped: <its own reason>; or try ZOT_SPEAKS_SINK=paplay`) — never a silent
-failure, and no player is retried behind your back. A player that is not installed at all is
-reported as `brew install ffmpeg`, or as the pin to set.
+failure, and no player is retried behind your back. Its words have to be the report: measured with
+`ffplay` n9.0.2, an unopenable audio device, an unreadable input and an unknown filter each exit with
+status **0**, so the exit code alone would call a run that played nothing a success. Only lines that
+name a fatal failure count; the warnings a healthy box writes to the same pipe (pipewire, ALSA) stay
+silent. A player that is not installed at all is reported as `brew install ffmpeg`, or as the pin to
+set.
 
 ## Verification checklist (a Mac is required)
 
@@ -77,8 +86,9 @@ Run `zot`, load the extension, and report each row back — including "worked fi
 | 8 | Hide ffmpeg (`brew unlink ffmpeg`) and run `/tts` | Does the error say `brew install ffmpeg`? |
 | 9 | Auto speak (`/tts-settings` → `a`), with and without `/tts stop` | Does it speak after a real turn, and does stop work there too? |
 | 10 | A long utterance at `vol 100`, then at `vol 60` | Is it clean, and does the volume setting take effect? |
+| 11 | `/tts-settings` → `s` → `0.5x`, then `2.0x`, and `/tts` at each | Does the rate change while the voice keeps its pitch, and does the note read `speed 0.5x through ffplay`? |
 
-What to send back: the notification lines you saw, the answers to 3, 5 and 6, and anything that
+What to send back: the notification lines you saw, the answers to 3, 5, 6 and 11, and anything that
 sounded wrong. The unknowns are exactly the things only a Mac can answer: whether SDL opens a
 window, how long `ffplay`'s stop tail really is, and whether Homebrew's `/opt/homebrew/bin` is on
 `PATH` for however zot is started.

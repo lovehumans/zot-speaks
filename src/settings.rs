@@ -35,6 +35,113 @@ pub const VOLUME_MAX: f32 = 1.0;
 /// The gain `100%` means, so `50%` lands on 1.0 (unity).
 pub const VOLUME_GAIN_AT_FULL: f32 = 2.0;
 
+/// Speaking speed: tenths of the model's natural rate. The ladder *is* the contract — `0.5x` to
+/// `2.0x` in `0.1` steps, `1.0x` by default — and it is stored as whole tenths so the steps stay
+/// exact: three arrow presses from `1.0x` are `1.3x`, not `1.2999999`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Speed(u8);
+
+pub const DEFAULT_SPEED: Speed = Speed(10);
+pub const SPEED_MIN: Speed = Speed(5);
+pub const SPEED_MAX: Speed = Speed(20);
+/// What one panel arrow does to the Speed row.
+pub const SPEED_STEP: u8 = 1;
+/// The ladder is counted in tenths, so this is how many rungs make one whole turn (`1.0x` is 10).
+const TENTHS_PER_UNIT: f64 = 10.0;
+
+impl Speed {
+    pub const fn tenths(self) -> u8 {
+        self.0
+    }
+
+    /// The rung `direction` arrows away, clamped at both ends of the ladder.
+    pub fn stepped(self, direction: i8) -> Speed {
+        let moved = self.0 as i16 + i16::from(direction) * i16::from(SPEED_STEP);
+        Speed(moved.clamp(i16::from(SPEED_MIN.0), i16::from(SPEED_MAX.0)) as u8)
+    }
+
+    pub fn clamped(self) -> Speed {
+        Speed(self.0.clamp(SPEED_MIN.0, SPEED_MAX.0))
+    }
+
+    /// A speed from whole tenths, clamped onto the ladder: how a caller that already has a number
+    /// (a test, a settings file, a future flag) enters the type without reaching into it.
+    pub fn from_tenths(tenths: u8) -> Speed {
+        Speed(tenths.clamp(SPEED_MIN.0, SPEED_MAX.0))
+    }
+
+    /// `1.3x`, as the panel shows it.
+    pub fn label(self) -> String {
+        format!("{}.{:01}x", self.0 / 10, self.0 % 10)
+    }
+
+    /// The number the tempo filter wants (`"1.3"`), or `None` when the natural rate is meant —
+    /// the difference matters, because passing `atempo=1.0` is an engine invocation that says the
+    /// same thing in two different ways.
+    pub fn tempo_arg(self) -> Option<String> {
+        (self.0 != DEFAULT_SPEED.0).then(|| format!("{}.{:01}", self.0 / 10, self.0 % 10))
+    }
+
+    /// The speed to speak at, given an engine that cannot change tempo: never a lie, so the
+    /// natural rate.
+    pub fn speakable_when(self, tempo_supported: bool) -> Speed {
+        if tempo_supported {
+            self
+        } else {
+            DEFAULT_SPEED
+        }
+    }
+
+    /// The clock this speed implies for feeding a player: audio that takes a second at `1.0x` takes
+    /// half a second at `2.0x`, so whoever writes the PCM has to run at that multiple of real time
+    /// or the player starves. `1.0x` is exactly the natural pacing.
+    pub fn factor(self) -> f64 {
+        f64::from(self.0) / TENTHS_PER_UNIT
+    }
+}
+
+/// Read `speed` out of settings.json. Any number is taken, snapped to the nearest rung and
+/// clamped into the ladder; a value that is not a number means no speed was set. An off-ladder
+/// value is a reasonable near-miss rather than a broken file, so it is honoured as closely as the
+/// ladder allows and the returned note says exactly what we did — an unexpected setting is never
+/// silently discarded.
+fn read_speed(value: Option<&Value>) -> (Speed, Option<String>) {
+    let Some(value) = value else {
+        return (DEFAULT_SPEED, None);
+    };
+    let Some(raw) = value.as_f64() else {
+        return (
+            DEFAULT_SPEED,
+            Some(format!(
+                "speed in settings.json is {}, not a number; speaking at {}",
+                value,
+                DEFAULT_SPEED.label()
+            )),
+        );
+    };
+    let tenths = raw * 10.0;
+    // On a rung already: a whole tenth inside the ladder. Anything else is taken as the nearest
+    // rung we have.
+    let on_ladder = tenths >= f64::from(SPEED_MIN.0)
+        && tenths <= f64::from(SPEED_MAX.0)
+        && tenths == tenths.round();
+    // Whatever the file holds, it lands on a rung: `Speed::from_tenths` is the ladder's only door,
+    // and the clamp here is just keeping the number representable as tenths before it gets there.
+    let speed = Speed::from_tenths(tenths.round().clamp(0.0, f64::from(u8::MAX)) as u8);
+    (
+        speed,
+        (!on_ladder).then(|| {
+            format!(
+                "speed {} in settings.json is off the {} to {} ladder; speaking at {}",
+                quantized(raw as f32),
+                SPEED_MIN.label(),
+                SPEED_MAX.label(),
+                speed.label()
+            )
+        }),
+    )
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub voice: String, // catalog name ("" = model default)
@@ -43,6 +150,9 @@ pub struct Settings {
     /// Voices pinned with `f`. Normalized (sorted, deduped, non-empty) so the file and the
     /// picker's favorite block stay stable however they were pinned.
     pub favorites: Vec<String>,
+    /// How fast to speak, on the `Speed` ladder. Applied by the player, not by the model: see
+    /// `Speed::tempo_arg`.
+    pub speed: Speed,
     /// Speak the last agent message when a turn ends, for every project without its own override.
     pub auto_speak: bool,
     /// Per-project overrides of `auto_speak`, keyed by canonical project directory.
@@ -56,6 +166,7 @@ impl Default for Settings {
             temperature: DEFAULT_TEMPERATURE,
             volume: DEFAULT_VOLUME,
             favorites: Vec::new(),
+            speed: DEFAULT_SPEED,
             auto_speak: false,
             auto_speak_projects: BTreeMap::new(),
         }
@@ -66,6 +177,7 @@ impl Settings {
     pub fn clamped(mut self) -> Self {
         self.temperature = self.temperature.clamp(0.0, 1.0);
         self.volume = self.volume.clamp(VOLUME_MIN, VOLUME_MAX);
+        self.speed = self.speed.clamped();
         self.favorites.retain(|name| !name.trim().is_empty());
         self.favorites.sort();
         self.favorites.dedup();
@@ -222,6 +334,10 @@ pub fn load(path: &Path) -> Settings {
         .get("settings_version")
         .and_then(Value::as_u64)
         .unwrap_or(1);
+    let (speed, speed_note) = read_speed(value.get("speed"));
+    if let Some(note) = speed_note {
+        eprintln!("zot-speaks: {note}");
+    }
     // A file written before the dial existed stored a gain. Halving it gives the dial whose gain
     // is the same, so `1.1` (unity + 10%) becomes `0.55` and sounds identical.
     let volume = match (version, value.get("volume").and_then(Value::as_f64)) {
@@ -240,6 +356,7 @@ pub fn load(path: &Path) -> Settings {
             .and_then(Value::as_f64)
             .unwrap_or(DEFAULT_TEMPERATURE as f64) as f32,
         volume,
+        speed,
         favorites: value
             .get("favorites")
             .and_then(Value::as_array)
@@ -280,6 +397,7 @@ pub fn save(path: &Path, settings: &Settings) -> std::io::Result<()> {
         "voice": settings.voice,
         "temperature": quantized(settings.temperature),
         "volume": quantized(settings.volume),
+        "speed": f64::from(settings.speed.tenths()) / 10.0,
         "favorites": settings.favorites,
         "auto_speak": settings.auto_speak,
         "auto_speak_projects": settings.auto_speak_projects,
@@ -326,6 +444,102 @@ mod tests {
             loaded.favorites,
             "the file must not drift across runs"
         );
+    }
+
+    /// The Speed ladder is the contract (`0.5x` to `2.0x` in 0.1 steps, `1.0x` by default), and a
+    /// rung has to survive a save and a load exactly: a rate is a number the user reads off the
+    /// panel, so drift between runs would be the setting lying.
+    #[test]
+    fn speed_round_trips_as_a_rung_of_the_ladder() {
+        let path = scratch("speed-round-trip");
+        assert_eq!(
+            Settings::default().speed,
+            DEFAULT_SPEED,
+            "what a fresh install speaks at"
+        );
+
+        for tenths in [SPEED_MIN.tenths(), 13, SPEED_MAX.tenths()] {
+            let settings = Settings {
+                speed: Speed::from_tenths(tenths),
+                ..Settings::default()
+            };
+            save(&path, &settings).unwrap();
+            let file = std::fs::read_to_string(&path).unwrap();
+            let loaded = load(&path);
+            assert_eq!(
+                loaded.speed,
+                Speed::from_tenths(tenths),
+                "{} did not survive the file: {file}",
+                Speed::from_tenths(tenths).label()
+            );
+        }
+    }
+
+    /// A speed nobody can mean is still a speed the user set, so it is honoured as the nearest rung
+    /// we have rather than discarded — and the ladder's ends are shut, so a file cannot ask for
+    /// 3.5x just because someone hand-edited it. A value that is not a number means no speed.
+    #[test]
+    fn a_speed_off_the_ladder_lands_on_a_rung_instead_of_disappearing() {
+        let path = scratch("speed-off-ladder");
+        for (stored, tenths) in [
+            ("3.5", SPEED_MAX.tenths()),
+            ("0.4", SPEED_MIN.tenths()),
+            ("1.25", 13),
+        ] {
+            std::fs::write(&path, format!(r#"{{"voice":"Miles","speed":{stored}}}"#)).unwrap();
+            let loaded = load(&path);
+            assert_eq!(
+                loaded.speed,
+                Speed::from_tenths(tenths),
+                "speed {stored} should land on the nearest rung"
+            );
+        }
+        std::fs::write(&path, r#"{"voice":"Miles","speed":"fast"}"#).unwrap();
+        assert_eq!(
+            load(&path).speed,
+            DEFAULT_SPEED,
+            "a non-number is not a speed the user asked for"
+        );
+    }
+
+    /// What the player contract asks a speed for: the filter value only when it is not the natural
+    /// rate, the natural rate when the player has no tempo knob, and the clock the PCM writer paces
+    /// itself to.
+    #[test]
+    fn speed_answers_what_a_player_needs_to_ask_for() {
+        assert_eq!(
+            DEFAULT_SPEED.tempo_arg(),
+            None,
+            "1.0x is the players' own default; asking for atempo=1.0 would be a second way to say \
+             the same thing"
+        );
+        assert_eq!(
+            Speed::from_tenths(SPEED_MIN.tenths())
+                .tempo_arg()
+                .as_deref(),
+            Some("0.5")
+        );
+        assert_eq!(
+            Speed::from_tenths(SPEED_MAX.tenths())
+                .tempo_arg()
+                .as_deref(),
+            Some("2.0")
+        );
+        assert_eq!(
+            Speed::from_tenths(15).speakable_when(false),
+            DEFAULT_SPEED,
+            "a player without tempo says the natural rate, not a number it cannot do"
+        );
+        assert_eq!(
+            Speed::from_tenths(15).speakable_when(true),
+            Speed::from_tenths(15)
+        );
+        assert_eq!(
+            DEFAULT_SPEED.factor(),
+            1.0,
+            "the natural pacing is the default pacing"
+        );
+        assert_eq!(Speed::from_tenths(SPEED_MAX.tenths()).factor(), 2.0);
     }
 
     #[test]
