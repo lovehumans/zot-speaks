@@ -82,16 +82,6 @@ impl Speed {
         (self.0 != DEFAULT_SPEED.0).then(|| format!("{}.{:01}", self.0 / 10, self.0 % 10))
     }
 
-    /// The speed to speak at, given an engine that cannot change tempo: never a lie, so the
-    /// natural rate.
-    pub fn speakable_when(self, tempo_supported: bool) -> Speed {
-        if tempo_supported {
-            self
-        } else {
-            DEFAULT_SPEED
-        }
-    }
-
     /// The clock this speed implies for feeding a player: audio that takes a second at `1.0x` takes
     /// half a second at `2.0x`, so whoever writes the PCM has to run at that multiple of real time
     /// or the player starves. `1.0x` is exactly the natural pacing.
@@ -524,15 +514,6 @@ mod tests {
                 .tempo_arg()
                 .as_deref(),
             Some("2.0")
-        );
-        assert_eq!(
-            Speed::from_tenths(15).speakable_when(false),
-            DEFAULT_SPEED,
-            "a player without tempo says the natural rate, not a number it cannot do"
-        );
-        assert_eq!(
-            Speed::from_tenths(15).speakable_when(true),
-            Speed::from_tenths(15)
         );
         assert_eq!(
             DEFAULT_SPEED.factor(),
