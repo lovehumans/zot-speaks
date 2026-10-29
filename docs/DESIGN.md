@@ -12,22 +12,19 @@ extension does and how to run it, see [../README.md](../README.md).
   background thread; `stream_with` yields mono float PCM chunks so time-to-first-audio is
   independent of utterance length.
 * Audio: each chunk is scaled by `Settings::gain` (twice the volume dial), converted to mono s16le,
-  and written to the stdin of the first player that is installed — `ffplay` before `paplay`:
-  `ffplay -nodisp -autoexit -loglevel error -f s16le -ar 24000 -ch_layout mono -`, or
-  `paplay --raw --format=s16le --channels=1 --rate 24000`. They are
-  interchangeable because the contract is the same — raw s16le mono at the rate named — so there is
-  one write loop, one pacing rule and one stop rule. `ffplay` is the default because it is the one
-  player both Linux and macOS have; `paplay` is the fallback where ffmpeg is absent and the pin
-  `ZOT_SPEAKS_SINK=paplay` for a PipeWire/PulseAudio box that wants its native player
-  (ADR 2026-10-28, flipping the 10-27 order).
+  and written to the stdin of `ffplay`, the one external program this extension needs:
+  `ffplay -nodisp -autoexit -loglevel error -f s16le -ar 24000 -ch_layout mono -`, plus
+  `-af atempo=<speed>` whenever the Speed row is off `1.0x`. ffmpeg is a prerequisite, not a
+  preference (ADR-0019): `paplay` was dropped along with `ZOT_SPEAKS_SINK`, because a second player
+  meant a capability ladder that could quietly discard the speed you had set.
   `afplay` is not a candidate: it reads files, not a pipe, so using it would mean synthesizing the
   whole utterance before hearing any of it.
 * Writes are paced to real time with a 40 ms lead, which is what keeps time-to-first-sound low and
   the player's buffer small.
 * Stop is cooperative: the `SpeechStream` is dropped and the player's stdin is closed (EOF). An
   utterance that ran to its end gets to drain whatever the player holds; one that was cut short gets
-  a 150 ms grace and is then killed rather than left orphaned, because `paplay` exits on EOF at once
-  while `ffplay` sits on an SDL audio buffer. A player that gives up on its own is reported with its
+  a 150 ms grace and is then killed rather than left orphaned, because `ffplay` sits on an SDL audio
+  buffer. A player that gives up on its own is reported with its
   own words as a notification; one killed on purpose is not. `ffplay`'s exit status is not trusted:
   measured with n9.0.2, an unopenable audio device, an unreadable input and an unknown filter each
   exit **0**, so its stderr is read whatever the status claims and only its fatal lines count as
@@ -182,14 +179,11 @@ manifest and travels with the directory.
   headroom a quiet voice needs, and the clamp keeps `100%` from clipping anything louder.
 * **Speed** — a ladder from `0.5x` to `2.0x` in `0.1` steps, default `1.0x`, stored as the plain
   number you would say (`1.2`). It is a **player** setting, not a model setting: Phonon always
-  synthesizes at its own natural rate, and the chosen player is asked for the tempo — `ffplay`
-  through ffmpeg's `atempo` filter (`-af atempo=1.2`), which stretches time without shifting pitch.
-  `paplay` has no tempo flag, so a speak through it is spoken at `1.0x` whatever the row says, and
-  the extension says so out loud once per session rather than letting the row read as a promise
-  nothing kept; the note names `ZOT_SPEAKS_SINK=ffplay` as the pin that would honor it. A value
+  synthesizes at its own natural rate, and the player is asked for the tempo — `ffplay` through
+  ffmpeg's `atempo` filter (`-af atempo=1.2`), which stretches time without shifting pitch. A value
   hand-edited off the ladder (`3.5`) is honoured as the nearest rung and announced, not discarded.
-  The real-time pacing of the PCM writer follows the rate actually spoken, so a faster request
-  drains faster instead of starving the player.
+  The real-time pacing of the PCM writer follows the rate asked of the player, so a faster request
+  drains faster instead of starving it.
 * **Temperature** — how much random noise Phonon puts into generating the speech, `0.0`–`1.0`,
   passed per request (`SpeechOptions.temperature`). Phonon renders speech by **flow matching**:
   it speaks one short frame at a time, and for each frame the model starts from seeded noise and
@@ -393,7 +387,7 @@ just lint       # cargo clippy
 `just` wraps cargo, one recipe per command; run the cargo commands directly if you prefer.
 
 Use the **release** build for live playback. The debug build generates audio slower than real time
-and would stutter `paplay`; the release build runs at about realtime. See `Cargo.toml`
+and would stutter playback; the release build runs at about realtime. See `Cargo.toml`
 `[profile.release]` (`opt-level=3`, `lto`, `panic="abort"`).
 
 ### Installing what you built
@@ -417,7 +411,7 @@ crate cache, not a source problem.
   `atempo` (see the *Speed* setting) is what makes the dial mean anything, and it is a linear
   time-stretch: it cannot repair prosody, and the artifacts it does introduce are ffmpeg's. A
   player-independent stretch (WSOLA or a phase vocoder in our own write path) would free the setting
-  from `ffplay` and from `paplay`'s silence about it. Not scheduled.
+  from `ffplay`. Not scheduled.
 * **Quantisation is measured, and declined.** The Rust API exposes `Quant` (`q8_0`, `q4k`, CPU-only)
   and `ptts` exposes `--quant`; this extension uses `Quant::F32`. On this box `q8_0` saves about 50 MB
   of peak memory and costs the first sound — roughly 4 ms at 8 threads, 15–17 ms at 16 — so it is
@@ -429,8 +423,7 @@ crate cache, not a source problem.
   when zot is run one-shot (`zot -p "…"`, or a prompt on a pipe), so there is no time left to
   synthesize and play before the host tears the extension down; auto speak is an interactive-session
   feature. `/tts` in a one-shot run is cut off the same way.
-* Mono, 24 kHz output, piped to `ffplay` by default and to `paplay` where ffmpeg is absent (or when
-  `ZOT_SPEAKS_SINK=paplay` pins it); CPU inference only.
+* Mono, 24 kHz output, piped to `ffplay`; ffmpeg is a prerequisite (ADR-0019); CPU inference only.
 * **macOS playback has not been heard on a Mac by this project's CI.** The `ffplay` path is real and
   its contract is tested against a stand-in player, but first sound, stop tail and any SDL behaviour
   on macOS are a human check on real hardware.

@@ -18,60 +18,49 @@
 //!     utterance, a Silence, or a close
 //!   shutdown -> stop, shutdown_ack, exit
 //!
-//! Playback design (one contract, one code path):
+//! Playback design (one contract, one code path — the sink, `zot_speaks::sink`):
 //!   * `stream_with` yields mono f32 PCM chunks, so time-to-first-audio is decoupled from length.
-//!   * Each chunk is scaled by the volume dial (`Settings::gain`), converted to s16le, and piped to
-//!     the first player on the chain that is installed: `ffplay`, then `paplay` (ADR 2026-10-28).
-//!     Both read raw s16le mono on stdin, so nothing downstream knows or cares which one it got.
+//!   * The sink owns everything that reaches the player. `Sink::open` starts `ffplay` and states the
+//!     format (raw s16le mono on stdin, the speed asked of the player through ffmpeg's `atempo`
+//!     filter rather than re-timed here); `Sink::write` scales a chunk by the volume dial
+//!     (`Settings::gain`), converts it to s16le and feeds it at the player's pace; `Sink::finish`
+//!     drains or kills the player and turns what it said into a sentence. What is left here owns the
+//!     utterance: what to synthesize, and when a Stop or a superseding request ends it.
 //!   * Voice and temperature go through `SpeechOptions`, resolved against the locally-registered
 //!     voice catalog, and every utterance is synthesized from its own noise seed (`tts::SeedPlan`;
 //!     `ZOT_SPEAKS_SEED` pins the sequence) so a repeated line is a new take, not the same one.
 //!     Stop is cooperative: we drop the `SpeechStream` and close the sink's stdin.
-//!   * Writes are paced to real time so the player never buffers far ahead — low TTFB, short tail.
+//!   * Pacing to real time lives in the sink, so the player never buffers far ahead — low TTFB,
+//!     short tail.
 
-mod cache;
 mod panel;
-mod settings;
-mod tts;
-mod voices;
 mod wire;
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ptts::synth::Synth;
 use serde_json::{json, Value};
 
+use zot_speaks::cache;
+use zot_speaks::settings::{self, Settings};
+use zot_speaks::sink::Sink;
+use zot_speaks::tts;
+use zot_speaks::voices::{self, VoiceInfo};
+
 use panel::{KeyOutcome, Preview, SettingsPanel, PANEL_ID};
-use settings::{Settings, Speed};
-use voices::VoiceInfo;
 use wire::Out;
 
 const NAME: &str = "zot-speaks";
 /// One version per artifact: the package version in `Cargo.toml`, which `dev/test.sh` checks
 /// against the version in `extension.json` before it accepts the hello frame.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// How far ahead of real-time playback we run: small enough that a stop goes quiet within a
-/// chunk, large enough that `paplay` never starves.
-const PLAY_LEAD: Duration = Duration::from_millis(40);
-
-/// `ZOT_SPEAKS_SINK=paplay|ffplay` pins one player; unset or empty means "pick for me". It is how
-/// the wire tests exercise a player the machine running them does not have.
-const SINK_ENV: &str = "ZOT_SPEAKS_SINK";
-
-/// How long a sink cut short may keep draining before we kill it. `paplay` sees EOF and exits
-/// within a tick; `ffplay` is the player that sits on an SDL audio buffer, so this is what bounds
-/// the tail of a stopped utterance.
-const STOP_GRACE: Duration = Duration::from_millis(150);
-const STOP_GRACE_TICK: Duration = Duration::from_millis(10);
 
 /// The breath between two repetitions of the same line, so a repeated explanation is a sentence you
 /// can follow rather than a stutter. Synthesis time adds to it; this is the floor.
@@ -154,9 +143,6 @@ fn frame_session(frame: &Value) -> &str {
 }
 
 fn main() {
-    // Give `ort` a sane thread count once, before any thread touches env or the model.
-    apply_ptts_env();
-
     let out = Out::new();
     let messages = Arc::new(Mutex::new(Messages::default()));
     let playing = Arc::new(AtomicBool::new(false));
@@ -637,171 +623,6 @@ fn live_settings(current: &Arc<Mutex<Settings>>, voice: &str) -> Settings {
     }
 }
 
-/// The players we know how to pipe raw PCM to, tried in this order unless `ZOT_SPEAKS_SINK` pins
-/// one. `ffplay` (ffmpeg) is the default on every platform: it is the one player Linux and macOS
-/// both have, and it always eats raw PCM from a pipe. `paplay` is the native PipeWire/PulseAudio
-/// player, kept as the fallback for a box without ffmpeg and available as the explicit pin
-/// `ZOT_SPEAKS_SINK=paplay` (ADR 2026-10-28, flipping the 10-27 order). `afplay` is deliberately
-/// absent: it wants a file, so using it would mean buffering the whole utterance first.
-const PLAYERS: [&str; 2] = ["ffplay", "paplay"];
-
-/// The chain for one utterance. A pin that names nothing known selects nothing at all, so a typo
-/// in `ZOT_SPEAKS_SINK` reports itself instead of quietly playing through a player the user asked
-/// us not to use.
-fn player_chain(pin: Option<&str>) -> Vec<&'static str> {
-    PLAYERS
-        .into_iter()
-        .filter(|&player| pin.is_none_or(|wanted| wanted == player))
-        .collect()
-}
-
-/// How each player is told the format: mono s16le on stdin at this rate. Everything after the
-/// spawn is shared, because the format is the whole contract. Only a player that can change tempo
-/// (see `speakable_speed`) is ever handed a speed, which is why the `paplay` arm has no tempo flag
-/// at all — the natural rate is its only rate.
-fn player_args(player: &str, rate: u32, speed: Speed) -> Vec<String> {
-    let rate = rate.to_string();
-    match player {
-        "paplay" => vec![
-            "--raw".into(),
-            "--format=s16le".into(),
-            "--channels=1".into(),
-            "--rate".into(),
-            rate,
-        ],
-        _ => {
-            let mut args = vec![
-                "-nodisp".into(),
-                "-autoexit".into(),
-                "-loglevel".into(),
-                "error".into(),
-                "-f".into(),
-                "s16le".into(),
-                "-ar".into(),
-                rate,
-                "-ch_layout".into(), // not `-ac 1`: removed in newer ffmpeg
-                "mono".into(),
-            ];
-            // `atempo` changes the rate without changing the pitch. It has to sit before the `-`,
-            // because ffmpeg reads it as an option on the input that follows it, and the input is
-            // the pipe.
-            if let Some(tempo) = speed.tempo_arg() {
-                args.push("-af".into());
-                args.push(format!("atempo={tempo}"));
-            }
-            args.push("-".into());
-            args
-        }
-    }
-}
-
-/// Whether this player can change the rate of what it is fed without changing the pitch. `ffplay`
-/// gets ffmpeg's `atempo` filter; `paplay` has no such knob in its flags, so the natural rate is its
-/// only rate. The caller feeds the answer to `Speed::speakable_when`, which is what decides whether
-/// the Speed setting means anything on this machine.
-fn tempo_changeable(player: &str) -> bool {
-    player == "ffplay"
-}
-
-static SPEED_UNHONORED: AtomicBool = AtomicBool::new(false);
-
-/// What we say, once per session, when the player that answered cannot speak at the speed the
-/// settings asked for. Said out loud because the Speed row would otherwise read as a promise; said
-/// once because repeating it on every utterance and every panel audition would bury the setting.
-fn speed_unhonored_note(player: &str, asked: Speed, spoken: Speed) -> String {
-    format!(
-        "zot-speaks: {player} cannot change speed, so it speaks at {} not {} — ffplay can, so \
-         {SINK_ENV}=ffplay (or no pin at all) is what makes the Speed setting mean something",
-        spoken.label(),
-        asked.label(),
-    )
-}
-
-/// Why nothing could be started — the three shapes are different problems and must not share one
-/// sentence: a pin that names a player we do not know, a pin that names one we do know but that is
-/// not on this machine (`ZOT_SPEAKS_SINK=paplay` on a Mac is the obvious one), and no player at all.
-/// Pure, so the wording is testable without a subprocess.
-fn no_player_hint(pin: Option<&str>) -> String {
-    match pin {
-        Some(pinned) if !PLAYERS.contains(&pinned) => format!(
-            "{SINK_ENV}='{pinned}' is not a player zot-speaks knows ({})",
-            PLAYERS.join(", ")
-        ),
-        Some(pinned) => format!(
-            "{SINK_ENV}='{pinned}' is known but not installed; install it, or unset {SINK_ENV} to let zot-speaks choose ({})",
-            PLAYERS.join(", ")
-        ),
-        None if cfg!(target_os = "macos") => {
-            "no audio player found: brew install ffmpeg, or set ZOT_SPEAKS_SINK".to_string()
-        }
-        None => {
-            "no audio player found: install ffmpeg or paplay, or set ZOT_SPEAKS_SINK".to_string()
-        }
-    }
-}
-
-/// Nothing we could start: report the reason. No fallback is attempted — a pin is what the user
-/// asked for, and a missing player is reported rather than replaced by something they excluded.
-fn no_player(out: &Out, pin: Option<&str>) {
-    out.notify("error", &format!("zot-speaks: {}", no_player_hint(pin)));
-}
-
-/// Lines a player prints when it could not play at all. Measured with ffplay n9.0.2: an unopenable
-/// audio device, an unreadable input and an unknown filter each exit with status **0** (only an
-/// unrecognised argument exits 1), so a fatal `ffplay` run can look exactly like a successful one
-/// and these lines are the only report it gives.
-///
-/// Deliberately narrow, because a healthy run is not quiet either: pipewire's `scandir … Permission
-/// denied` and the ALSA library's complaints arrive on the same stderr and must not read as failure.
-const FATAL_PLAYER_LINES: [&str; 4] = [
-    "failed to open",
-    "audio open failed",
-    "no such filter",
-    "error processing filtergraph",
-];
-
-/// Why a player's run ended badly, in that player's own words, or None when it ended well.
-///
-/// `paplay` reports failure through its exit status. `ffplay` does not (see `FATAL_PLAYER_LINES`),
-/// so a fatal line counts whatever the exit status claims; a run that failed without naming a reason
-/// still gets its first stderr line, which is the best report available.
-/// Pure, so both shapes are testable without a subprocess.
-fn player_failure_reason(exit_ok: bool, stderr: &str) -> Option<String> {
-    if let Some(line) = stderr.lines().map(str::trim).find(|line| {
-        let lower = line.to_lowercase();
-        FATAL_PLAYER_LINES
-            .iter()
-            .any(|marker| lower.contains(marker))
-    }) {
-        return Some(line.to_owned());
-    }
-    (!exit_ok).then(|| {
-        stderr
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or("nothing on stderr")
-            .to_owned()
-    })
-}
-
-/// Tell the user what the player said. Both players write little (`-loglevel error`), and the reason
-/// has already been picked out of whatever they wrote. Installed-but-broken (`paplay` with no sound
-/// server, `ffplay` with no audio device) is not the same as absent, so the note names the other
-/// player the user can pin: a dead sound server should not read as a dead `/tts`.
-fn report_player_error(out: &Out, player: &str, reason: &str) {
-    let alternative = PLAYERS
-        .iter()
-        .copied()
-        .find(|&other| other != player)
-        .map(|other| format!("; or try {SINK_ENV}={other}"))
-        .unwrap_or_default();
-    out.notify(
-        "error",
-        &format!("zot-speaks: {player} stopped: {reason}{alternative}"),
-    );
-}
-
 /// Synthesize + stream one text under the given settings, watching for a cooperative Stop or a
 /// superseding Play between PCM chunks. `seeds` is asked for one seed per utterance, which is what
 /// makes a repeated line a new take rather than the same one replayed. Returns what the caller
@@ -833,100 +654,49 @@ fn play_one(
         }
     };
     let rate = stream.sample_rate();
-    // Start the first player on the chain that is installed; from here on nothing knows or cares
-    // which one it is, because they all eat the same PCM on stdin. A player that starts and then
-    // dies is not a spawn failure — it is reported where it actually shows up, at the teardown.
-    let pin = std::env::var(SINK_ENV).ok().filter(|name| !name.is_empty());
-    // Each candidate is asked what rate it can actually speak at, so the player that answers decides
-    // both its own argv and the pacing below. A pin that names a player without a tempo knob speaks
-    // at the natural rate and says so once.
-    let asked_speed = settings.speed;
-    let Some((player, spoken_speed, mut child)) =
-        player_chain(pin.as_deref()).iter().find_map(|&player| {
-            let speed = asked_speed.speakable_when(tempo_changeable(player));
-            Command::new(player)
-                .args(player_args(player, rate, speed))
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn()
-                .ok()
-                .map(|child| (player, speed, child))
-        })
-    else {
-        no_player(out, pin.as_deref());
-        return Resume::Idle;
-    };
-    if spoken_speed != asked_speed && !SPEED_UNHONORED.swap(true, Ordering::Relaxed) {
-        out.notify(
-            "warn",
-            &speed_unhonored_note(player, asked_speed, spoken_speed),
-        );
-    }
-    let mut sink = match child.stdin.take() {
-        Some(sink) => sink,
-        None => {
-            // Cannot happen with `Stdio::piped()`. If it ever does, do not leave the child behind.
-            let _ = child.kill();
-            let _ = child.wait();
-            out.notify("error", &format!("zot-speaks: no stdin for {player}"));
+    // Start the player. Spawn is part of streaming, not a preflight: the pipe exists while the model
+    // is still working, so sound starts at the first chunk. A player that starts and then dies is not
+    // a spawn failure — it is reported where it actually shows up, at the teardown.
+    let speed = settings.speed;
+    let mut sink = match Sink::open(rate, speed, settings.gain()) {
+        Ok(sink) => sink,
+        Err(e) => {
+            // "Not installed", "present but not startable" and "no stdin" are three different
+            // sentences and Sink names them; only the first is an install hint.
+            out.notify("error", &format!("zot-speaks: {}", e.report()));
             return Resume::Idle;
         }
     };
 
-    // Named only now that a player is actually running: the user hears which one they are hearing,
-    // and a request that could not be played is not announced as if it were.
+    // Announced only now that the player is actually running: a request that could not be played is
+    // not announced as if it were. The player is not named — there is one, and it earns a mention
+    // only when it fails.
     out.notify(
         "info",
         &format!(
-            "zot-speaks: speaking as {} at temp {:.2}, vol {:.0}%, speed {} through {player}",
+            "zot-speaks: speaking as {} at temp {:.2}, vol {:.0}%, speed {}",
             used_voice.clone().unwrap_or_else(|| "default".to_string()),
             options.temperature.unwrap_or(0.0),
             settings.volume * 100.0,
-            spoken_speed.label(),
+            speed.label(),
         ),
     );
 
-    let gain = settings.gain();
-    // The pacing clock follows the player, not the setting: a player handed the tempo filter drains
-    // what we write that much faster than natural time, and feeding it at natural time would starve
-    // it. At 1.0x this is the clock it has always been.
-    let tempo = spoken_speed.factor();
     playing.store(true, Ordering::SeqCst);
-    let started = Instant::now();
-    let mut samples_written: u64 = 0;
     // An utterance that reaches the end of its stream has finished; that is what a repeat request
     // waits for. A Stop, a player that gave up, or a line with no audio in it says `Idle` instead.
     let mut resume = Resume::Finished;
-    // Audio the user has moved on from: drives the bounded drain at the teardown below.
+    // Audio the user has moved on from: drives the bounded grace at the teardown below.
     let mut cut_short = false;
-    let mut buffer: Vec<u8> = Vec::new();
 
     for chunk in stream.by_ref() {
         match chunk {
             Ok(samples) => {
-                buffer.clear();
-                buffer.reserve(samples.len() * 2);
-                for &sample in &samples {
-                    let value = if sample.is_finite() {
-                        (sample * gain).clamp(-1.0, 1.0)
-                    } else {
-                        0.0
-                    };
-                    buffer.extend_from_slice(
-                        &((value * 32767.0).round().clamp(-32768.0, 32767.0) as i16).to_le_bytes(),
-                    );
-                }
-                if sink.write_all(&buffer).is_err() {
-                    break; // sink vanished (paplay died); stop cleanly
-                }
-                samples_written += samples.len() as u64;
-
-                // Pace to real time so the sink buffer stays small: this is what makes both
-                // TTFB low and the stop tail short.
-                let audio = Duration::from_secs_f64(samples_written as f64 / (rate as f64 * tempo));
-                if audio > started.elapsed() + PLAY_LEAD {
-                    thread::sleep(audio - started.elapsed() - PLAY_LEAD);
+                // `write` is the whole feed: encode, hand over, and wait out the share of real time
+                // the chunk represents, so the sink buffer stays small. That pacing is what makes
+                // both TTFB low and the stop tail short.
+                if sink.write(&samples).is_err() {
+                    break; // sink vanished (the player died); stop cleanly
                 }
             }
             Err(e) => {
@@ -969,127 +739,28 @@ fn play_one(
 
     playing.store(false, Ordering::SeqCst);
     drop(stream); // SpeechStream::drop halts generation workers.
-                  // Cooperative stop: closing our stdin is EOF for the player. An utterance that ran to its end
-                  // gets to drain whatever the player still holds. One that was cut short is audio nobody wants
-                  // any more, so it gets a bounded grace — `paplay` sees EOF and exits within a tick, `ffplay` is
-                  // the one that sits on an SDL buffer — and is then killed rather than orphaned.
-    drop(sink);
-    let mut killed = false;
-    if cut_short {
-        let deadline = Instant::now() + STOP_GRACE;
-        while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
-            thread::sleep(STOP_GRACE_TICK);
-        }
-        killed = true;
-        let _ = child.kill();
-    }
-    // A player that gave up on its own has something to say; one we killed on purpose does not.
-    // stderr is read whatever the exit status says, because `ffplay` exits 0 even when it managed to
-    // play nothing (see `FATAL_PLAYER_LINES`), and stdin is already closed, so reading it to EOF
-    // after the child is reaped cannot block.
-    if !killed {
-        let exit_ok = matches!(child.wait(), Ok(status) if status.success());
-        let mut stderr = String::new();
-        if let Some(mut pipe) = child.stderr.take() {
-            let _ = pipe.read_to_string(&mut stderr);
-        }
-        if let Some(reason) = player_failure_reason(exit_ok, &stderr) {
-            report_player_error(out, player, &reason);
-            // A player that gave up is not worth repeating after.
-            resume = Resume::Idle;
-        }
+
+    // The teardown is the sink's: close the pipe, wait for the player or kill it, and find out what
+    // it has to say about how its run ended. A player that gave up is not worth repeating after.
+    let finished = sink.finish(cut_short);
+    if let Some(reason) = finished.failure() {
+        out.notify("error", &format!("zot-speaks: {reason}"));
+        resume = Resume::Idle;
     }
     // A line that produced no audio at all is nothing to repeat either; otherwise a broken player
     // would make an explanation retry forever.
-    if samples_written == 0 {
+    if finished.silent() {
         resume = Resume::Idle;
     }
     resume
 }
 
-/// Size the inference worker pool, once, before the model load.
-///
-/// The variable that actually moves this pipeline is `RAYON_NUM_THREADS`: `ptts` computes through
-/// `xn`, whose pool width is read from that variable and then fixed at first use
-/// (`xn-0.2.12/src/utils.rs`, `xn-0.2.12/src/threadpool.rs`). `OMP_NUM_THREADS` — what this
-/// function used to set alone — is not read by that pool at all, so a `ZOT_TTS_THREADS` pin written
-/// into it changed nothing (measured 2026-10-28 and again 2026-10-29: identical timings for
-/// `OMP_NUM_THREADS=8` and `16` in `examples/stream_smoke.rs`). The `ort` variables stay as they
-/// are; nothing in the current dependency tree is `ort`, and they are harmless.
-///
-/// Default is one worker per *physical* core. Measured on an 8-core / 16-thread box
-/// (`examples/stream_smoke.rs`, one 8.00 s utterance, 3 reps per point, 2026-10-29; the 2026-10-28
-/// run gave the same shape, and `agents/history/2026-10-29-inference-threads-and-quantization.md`
-/// holds both tables):
-/// `RAYON_NUM_THREADS=16` TTFB 49-52 ms, total 923-959 ms; `8` TTFB 29-32 ms, total 505-515 ms;
-/// `4` TTFB 33-39 ms, total 547-597 ms; `2` TTFB 83-102 ms, total 801-837 ms. A hyperthread adds
-/// dispatch and no throughput to a vectorised gemm, so one worker per logical CPU is the worst
-/// point on an SMT box — 1.8x slower than physical cores here. `ZOT_TTS_THREADS=<n>` pins the
-/// answer for anyone who knows their box better; an unparsable pin falls back to the rule.
-fn apply_ptts_env() {
-    let logical = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let physical = std::fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .as_deref()
-        .and_then(physical_cores_from_cpuinfo);
-    let pin = std::env::var("ZOT_TTS_THREADS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok());
-    let threads = worker_threads(pin, logical, physical).to_string();
-    std::env::set_var("RAYON_NUM_THREADS", &threads);
-    std::env::set_var("OMP_NUM_THREADS", &threads);
-    std::env::set_var("ORT_DISABLE_THREAD_POOLS", "1");
-    std::env::set_var("ORT_SESSION_INTRA_OP_THREAD_POOL_SIZE", "0");
-}
-
-/// The thread rule, kept apart from reading the environment so it can be tested outright:
-/// a positive pin wins, else physical cores clamped to what the box calls logical, else logical.
-fn worker_threads(pin: Option<usize>, logical: usize, physical: Option<usize>) -> usize {
-    if let Some(pinned) = pin.filter(|n| *n > 0) {
-        return pinned;
-    }
-    let logical = logical.max(1);
-    physical
-        .map(|cores| cores.clamp(1, logical))
-        .unwrap_or(logical)
-}
-
-/// Physical cores as Linux's `/proc/cpuinfo` describes them: the distinct (`physical id`,
-/// `core id`) pairs, so SMT siblings count once and sockets add up. `None` where the file names no
-/// cores at all (some ARM and VM kernels), which is the caller's cue to fall back to logical CPUs.
-fn physical_cores_from_cpuinfo(text: &str) -> Option<usize> {
-    let mut seen = std::collections::HashSet::new();
-    let mut package = 0usize;
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        let Ok(number) = value.trim().parse::<usize>() else {
-            continue;
-        };
-        match key.trim() {
-            "physical id" => package = number,
-            "core id" => {
-                seen.insert((package, number));
-            }
-            _ => {}
-        }
-    }
-    (!seen.is_empty()).then_some(seen.len())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        coalesce, is_final_stop, live_settings, no_player_hint, physical_cores_from_cpuinfo,
-        player_args, player_chain, player_failure_reason, speed_unhonored_note, tempo_changeable,
-        worker_threads, Cmd, Messages, Resume,
-    };
-    use crate::settings::{Settings, Speed, DEFAULT_SPEED, SPEED_MAX, SPEED_MIN};
+    use super::{coalesce, is_final_stop, live_settings, Cmd, Messages, Resume};
     use std::sync::mpsc::{self, Sender};
     use std::sync::{Arc, Mutex};
+    use zot_speaks::settings::Settings;
 
     /// Auto-speak hangs on this gate, so it is worth naming the values out loud. The host's own
     /// name for a finished answer (`end`, what zot puts on the wire) and the provider's name the
@@ -1135,146 +806,6 @@ mod tests {
             "a slot holds its latest message"
         );
         assert_eq!(m.newest, "third", "/tts reads what was last written");
-    }
-
-    /// Every player is tried in order unless `ZOT_SPEAKS_SINK` pins one, and an unknown name pins
-    /// nothing at all — a typo must not quietly fall back to a player the user excluded.
-    #[test]
-    fn a_pinned_sink_selects_one_and_an_unknown_name_selects_none() {
-        assert_eq!(player_chain(None), vec!["ffplay", "paplay"]);
-        assert_eq!(player_chain(Some("ffplay")), vec!["ffplay"]);
-        assert_eq!(player_chain(Some("paplay")), vec!["paplay"]);
-        assert!(player_chain(Some("mpv")).is_empty());
-    }
-
-    /// The three ways a speak can have no player are three different diagnoses. A typo in the pin,
-    /// a pin naming a real player this machine does not have (`paplay` on macOS), and no player at
-    /// all must not collapse into one sentence that is wrong for two of them.
-    #[test]
-    fn a_missing_player_names_itself_more_precisely_than_a_bad_pin() {
-        let bad_pin = no_player_hint(Some("mpv"));
-        assert!(bad_pin.contains("mpv"));
-        assert!(bad_pin.contains("not a player zot-speaks knows"));
-        let absent_pin = no_player_hint(Some("paplay"));
-        assert!(absent_pin.contains("paplay"));
-        assert!(absent_pin.contains("known but not installed"));
-        assert!(!absent_pin.contains("not a player zot-speaks knows"));
-        let nothing = no_player_hint(None);
-        assert!(nothing.contains("no audio player found"));
-        assert!(nothing.contains("ZOT_SPEAKS_SINK"));
-    }
-
-    /// The whole point of the chain is that every player eats the same PCM, so one write loop and
-    /// one stop rule serve them all (ADR 2026-10-27). At the natural speed neither gets a word about
-    /// tempo: the contract is the format, and `1.0x` is the rate both default to.
-    #[test]
-    fn every_player_is_told_the_exact_pcm_contract() {
-        assert_eq!(
-            player_args("paplay", 24000, DEFAULT_SPEED),
-            ["--raw", "--format=s16le", "--channels=1", "--rate", "24000"]
-        );
-        assert_eq!(
-            player_args("ffplay", 22050, DEFAULT_SPEED),
-            [
-                "-nodisp",
-                "-autoexit",
-                "-loglevel",
-                "error",
-                "-f",
-                "s16le",
-                "-ar",
-                "22050",
-                "-ch_layout",
-                "mono",
-                "-",
-            ]
-        );
-    }
-
-    /// The speed reaches the player that can honor it, as a tempo filter sitting on the input it is
-    /// about to read. The exact numbers matter because `0.5x` and `2.0x` are the ends of the ladder
-    /// and a truncated or rounded filter would speak at a rate the panel never offered.
-    #[test]
-    fn the_speed_rides_on_the_ffplay_command_as_atempo() {
-        for (tenths, tempo) in [
-            (SPEED_MIN.tenths(), "0.5"),
-            (12, "1.2"),
-            (SPEED_MAX.tenths(), "2.0"),
-        ] {
-            let args = player_args("ffplay", 24000, Speed::from_tenths(tenths));
-            let joined = args.join(" ");
-            assert!(
-                joined.contains(&format!("-af atempo={tempo}")),
-                "{joined} does not ask ffplay for {tempo}"
-            );
-            assert_eq!(
-                args.last().map(String::as_str),
-                Some("-"),
-                "the filter must precede the pipe it applies to: {joined}"
-            );
-        }
-    }
-
-    /// A pinned player with no tempo knob is not a reason to refuse the request: it speaks at the
-    /// natural rate, and the Speed row has to say so in the same breath. This is `paplay` on any
-    /// platform, and the whole of what a user can expect from `ZOT_SPEAKS_SINK=paplay`.
-    #[test]
-    fn a_player_without_tempo_is_silent_about_speed_rather_than_loud_about_nothing() {
-        assert!(!tempo_changeable("paplay"));
-        assert!(tempo_changeable("ffplay"));
-        assert_eq!(
-            player_args("paplay", 24000, Speed::from_tenths(SPEED_MAX.tenths())),
-            ["--raw", "--format=s16le", "--channels=1", "--rate", "24000"]
-        );
-        let note = speed_unhonored_note(
-            "paplay",
-            Speed::from_tenths(15),
-            Speed::from_tenths(DEFAULT_SPEED.tenths()),
-        );
-        assert!(note.contains("paplay cannot change speed"));
-        assert!(note.contains("1.0x not 1.5x"));
-        assert!(note.contains("ZOT_SPEAKS_SINK=ffplay"));
-    }
-
-    /// A failed `ffplay` exits 0. Measured with n9.0.2: no audio device, an unreadable input and an
-    /// unknown filter all exit successfully — only an unrecognised argument exits 1 — so its exit
-    /// status cannot be the report and its own words have to be. The warnings that accompany a run
-    /// that really did play must not turn into errors the user has to read.
-    #[test]
-    fn a_player_that_exits_well_after_playing_nothing_still_says_so() {
-        // Verbatim shape of `ffplay` on this box with no usable audio device.
-        let dead_device =
-            "[W] pw.conf | scandir /etc/pipewire/client.conf.d failed: Permission denied\n\
-             ALSA lib pcm.c:2722:(snd_pcm_open_noupdate) [error.pcm] Unknown PCM default\n\
-             No more combinations to try, audio open failed\n\
-             Failed to open file 'fd:' or configure filtergraph";
-        assert_eq!(
-            player_failure_reason(true, dead_device).as_deref(),
-            Some("No more combinations to try, audio open failed"),
-            "status 0 is not success for this player"
-        );
-        let bad_filter =
-            "[AVFilterGraph @ 0x7f30] Error processing filtergraph: Filter not found\n\
-             Failed to open file 'fd:' or configure filtergraph";
-        assert_eq!(
-            player_failure_reason(true, bad_filter).as_deref(),
-            Some("[AVFilterGraph @ 0x7f30] Error processing filtergraph: Filter not found"),
-        );
-        // The same noise from a run that played everything: not a failure.
-        let healthy =
-            "[W] pw.conf | scandir /etc/pipewire/client.conf.d failed: Permission denied\n\
-             ALSA lib pcm.c:2722:(snd_pcm_open_noupdate) [error.pcm] Unknown PCM default";
-        assert_eq!(player_failure_reason(true, healthy), None);
-        assert_eq!(player_failure_reason(true, ""), None);
-        // `paplay` does report through its status, with or without a line to say why.
-        assert_eq!(
-            player_failure_reason(false, "Connection failure: Connection refused").as_deref(),
-            Some("Connection failure: Connection refused"),
-        );
-        assert_eq!(
-            player_failure_reason(false, "").as_deref(),
-            Some("nothing on stderr")
-        );
     }
 
     /// A repeat repeats because a drain that found nothing hands back the request it was given: the
@@ -1344,119 +875,5 @@ mod tests {
             (spoken.volume - 0.40).abs() < 1e-6,
             "a repeat follows the dial as it moves"
         );
-    }
-
-    /// The worker pool is a measured knob (see `apply_ptts_env`), so the rule is spelled out here
-    /// instead of being left to whatever the box happens to report.
-    #[test]
-    fn worker_threads_pins_first_and_physical_cores_otherwise() {
-        struct Case {
-            pin: Option<usize>,
-            logical: usize,
-            physical: Option<usize>,
-            want: usize,
-            why: &'static str,
-        }
-        const CASES: &[Case] = &[
-            Case {
-                pin: Some(3),
-                logical: 16,
-                physical: Some(8),
-                want: 3,
-                why: "a pin wins, however small",
-            },
-            Case {
-                pin: Some(32),
-                logical: 16,
-                physical: Some(8),
-                want: 32,
-                why: "a pin wins, however large",
-            },
-            Case {
-                pin: Some(0),
-                logical: 16,
-                physical: Some(8),
-                want: 8,
-                why: "a pin of zero is not a pin",
-            },
-            Case {
-                pin: None,
-                logical: 16,
-                physical: Some(8),
-                want: 8,
-                why: "SMT box: physical cores, not logical CPUs",
-            },
-            Case {
-                pin: None,
-                logical: 8,
-                physical: Some(8),
-                want: 8,
-                why: "no SMT: nothing changes",
-            },
-            Case {
-                pin: None,
-                logical: 16,
-                physical: None,
-                want: 16,
-                why: "no core info: logical CPUs",
-            },
-            Case {
-                pin: None,
-                logical: 4,
-                physical: Some(8),
-                want: 4,
-                why: "physical cores above the logical count are clamped",
-            },
-            Case {
-                pin: None,
-                logical: 0,
-                physical: None,
-                want: 1,
-                why: "a box that reports nothing still gets one worker",
-            },
-        ];
-        for case in CASES {
-            assert_eq!(
-                worker_threads(case.pin, case.logical, case.physical),
-                case.want,
-                "{}",
-                case.why
-            );
-        }
-    }
-
-    /// `/proc/cpuinfo` carries one block per logical CPU, so counting distinct (`physical id`,
-    /// `core id`) pairs is what turns 16 blocks into 8 cores and keeps two sockets additive. A
-    /// kernel that names no core ids gets `None`, which is the caller's cue to fall back.
-    #[test]
-    fn physical_cores_count_distinct_package_and_core_ids() {
-        let cpu = |package: usize, core: usize| {
-            format!("processor : x\nphysical id : {package}\ncpu cores : n/a\nsiblings : n/a\ncore id : {core}\n")
-        };
-        let smt: String = (0..8)
-            .flat_map(|core| [cpu(0, core), cpu(0, core)])
-            .collect();
-        let no_smt: String = (0..4).map(|core| cpu(0, core)).collect();
-        let sockets: String = (0..2)
-            .flat_map(|package| (0..4).map(move |core| cpu(package, core)))
-            .collect();
-        let cases: &[(&str, Option<usize>, &str)] = &[
-            (
-                &smt,
-                Some(8),
-                "8 cores / 16 threads, as this dev box reports itself",
-            ),
-            (&no_smt, Some(4), "4 cores, no SMT"),
-            (&sockets, Some(8), "2 sockets x 4 cores"),
-            ("", None, "an empty file says nothing about cores"),
-            (
-                "processor : 0\nmodel name : ARMv7 Processor rev 0\nFeatures : fp asimd",
-                None,
-                "a kernel that names no core ids",
-            ),
-        ];
-        for (text, want, why) in cases {
-            assert_eq!(physical_cores_from_cpuinfo(text), *want, "{why}");
-        }
     }
 }

@@ -20,11 +20,11 @@ machine. No network access, no account, no cloud voice.
 | ✅ Auto-speak of the final answer, scoped per project | |
 
 Phonon is a 31 M-parameter model: natural speech with imperfect prosody, not a commercial studio
-voice. Output is mono 24 kHz, piped to a player that reads raw PCM from a pipe.  
+voice. Output is mono 24 kHz, streamed into `ffplay`'s stdin while it is being generated.
 
 ## Requirements
 
-- `ffplay` (provided by `ffmpeg`, on Linux and macOS) or the fallback `paplay` (PipeWire / PulseAudio, on Linux). 
+- `ffplay`, which comes with `ffmpeg` (`apt install ffmpeg`, `brew install ffmpeg`). It is the one external program zot-speaks needs: it reads raw PCM from a pipe, so speech starts before the sentence is finished, and it is the player with a tempo control — which is what makes the Speed setting mean something.
 - CPU only — no GPU, no CUDA, no Metal. That is the point: the GPU stays free for your local LLM.
 - [The model](https://huggingface.co/gradium/phonon-31m-en) (99 MiB) and [the voices](https://huggingface.co/gradium/phonon-voices) (9 MiB) it uses must already be in your Hugging Face cache (helper scripts provided); this extension
   reads the cache and never downloads. Cache location: `$HF_HUB_CACHE`, `$HF_HOME/hub`,
@@ -62,7 +62,7 @@ Auto-speak reads the agent's final answer aloud when a turn ends. It is scoped p
 the row cycles `off → here → everywhere`.
 
 **Speed** is a tempo setting, which stretches the time without shifting
-the pitch. `paplay` has no tempo flag, so `ZOT_SPEAKS_SINK=paplay` always speaks at `1.0x` — and says so once rather than letting the Speed row read as a broken promise.
+the pitch: it is handed to `ffplay` as ffmpeg's `atempo` filter, never re-timed in the extension.
 
 **Repeats are new takes.** Every utterance is synthesized from its own noise seed, so saying the same
 line twice is not a replay — which is what makes the Temperature row audible as you step it. Set
@@ -213,7 +213,7 @@ macOS is source-build only — there is no macOS Release binary. You need a Rust
 ### Windows
 
 Windows isn't tested yet, but should theoretically work just the same as macOS: build from source, with
-`ffplay` from ffmpeg on your `PATH` (`paplay` is the Linux fallback and does not exist there). If you
+`ffplay` from ffmpeg on your `PATH`. If you
 test it, let me know!
 
 ### One-time bootstrap

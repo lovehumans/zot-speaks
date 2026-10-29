@@ -31,9 +31,9 @@
 //! should say, in which voice, and the caller (main.rs) owns the synth and the sink. Every preview
 //! is one utterance except `Explain`, which the caller repeats until it is cut off.
 
-use crate::settings::Settings;
-use crate::voices::VoiceInfo;
 use std::path::PathBuf;
+use zot_speaks::settings::Settings;
+use zot_speaks::voices::VoiceInfo;
 
 pub const PANEL_ID: &str = "zot-speaks-settings";
 
@@ -207,7 +207,7 @@ impl SettingsPanel {
                 "Choose a voice ({} ready of {} {} voices)",
                 self.ready(),
                 self.voices.len(),
-                crate::tts::MODEL_LANGUAGE
+                zot_speaks::tts::MODEL_LANGUAGE
             ),
         }
     }
@@ -262,7 +262,7 @@ impl SettingsPanel {
             "{} ready of {} {} voices",
             self.ready(),
             self.voices.len(),
-            crate::tts::MODEL_LANGUAGE
+            zot_speaks::tts::MODEL_LANGUAGE
         );
         vec![
             self.row(VOICE_ROW, "Voice", &format!("{voice_display}  ({summary})")),
@@ -305,7 +305,7 @@ impl SettingsPanel {
         if self.voices.is_empty() {
             lines.push(format!(
                 "no {} voices in the catalog — cache it once with `./ptts --voice Miles \"hi\"`, then re-run",
-                crate::tts::MODEL_LANGUAGE
+                zot_speaks::tts::MODEL_LANGUAGE
             ));
             return lines;
         }
@@ -803,8 +803,8 @@ fn mark_continued(row: &mut String, width: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{SPEED_MAX, SPEED_MIN};
     use std::path::PathBuf;
+    use zot_speaks::settings::{SPEED_MAX, SPEED_MIN};
 
     fn voice(name: &str, available: bool) -> VoiceInfo {
         VoiceInfo {

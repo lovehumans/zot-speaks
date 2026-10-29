@@ -6,6 +6,34 @@ published CI feeds that section to `gh release create --notes-file`. A Release's
 afterwards; a published tag cannot — which is why the notes live in a tracked file instead of in the
 tag message.
 
+## v1.9.0 — One player: `ffplay`, and ffmpeg is a prerequisite
+
+* **`ffplay` is the only player, and ffmpeg is a prerequisite rather than a preference.** The second
+  candidate (`paplay`, ADR-0010) is gone, and with it the fallback that could quietly discard the speed you
+  had set: a `paplay` run spoke at `1.0x` and had to say so (`speed 1.0x through paplay`). Speed is now
+  asked of the player on every platform this extension runs on — ffmpeg's `atempo`, the same `0.5x`–`2.0x`
+  ladder, no capability question in between.
+* **The cost, stated plainly:** a Linux box that has `paplay` (from `pulseaudio-utils`) and no `ffmpeg`
+  spoke in 1.8.x, and will not speak in 1.9.0 until ffmpeg is installed. Nothing else needs installing:
+  `ffplay` already was the player 1.8.2 used on this box, on every platform, by default.
+* **`ZOT_SPEAKS_SINK` is gone, not repurposed.** It selected a candidate; there is no choice to select.
+  Setting it in 1.9.0 does nothing at all, which `docs/MACOS.md` now says where the variable used to be
+  documented (its checklist is one row shorter).
+* **A box with no player gets one sentence, on every platform:**
+  `no audio player found: install ffmpeg so that \`ffplay\` is on your PATH`. It names no package manager —
+  which one to use is your business — and no player this release removes. `brew install ffmpeg` is still in
+  `docs/MACOS.md`, where it belongs.
+* **The spoken note stopped naming the player:** `zot-speaks: speaking as Azgorath at temp 0.35, vol 100%,
+  speed 1.2x`. With one candidate the word carried no choice, so `ffplay` now appears in user-visible text
+  only where it is actionable: in the failure path.
+* **Under the hood, with no behaviour change:** the crate is a library (`zot_speaks`: `cache`, `settings`,
+  `tts`, `voices`, `sink`) plus the extension binary, so `examples/stream_smoke.rs` measures the pipeline the
+  extension ships instead of a copy of it that can drift; and everything about how audio reaches the player
+  — the argv, the s16le conversion and its gain clamp, the pacing to real time, the drain-or-kill stop, the
+  fact that `ffplay` exits 0 even when it played nothing — now sits behind one module whose rules six unit
+  tests assert. 59 Rust tests in total, and CI runs all of them.
+* The panel's identity row and `extension.json` now read `1.9.0`.
+
 ## v1.8.2 — One worker per physical core
 
 * **Inference now asks for one worker thread per physical core, not per logical CPU.** The request is

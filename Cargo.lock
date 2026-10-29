@@ -1376,7 +1376,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zot-speaks"
-version = "1.8.2"
+version = "1.9.0"
 dependencies = [
  "ptts",
  "serde_json",
