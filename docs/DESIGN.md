@@ -40,17 +40,21 @@ extension does and how to run it, see [../README.md](../README.md).
   Auto speak   off
 ```
 
-Keys: `up`/`down` move the cursor · `left`/`right` (or `-`/`+`) adjust the focused row — a
+Keys: `↑`/`↓` move the cursor · `left`/`right` (or `-`/`+`) adjust the focused row — a
 **Volume or Speed change then says the selected voice out loud at the new level or rate**, so a
 level and a rate are something you hear rather than a number you read, and on **Temperature** they
 start that row explaining itself out loud, repeating while it stays selected (see *The Temperature
 row explains itself*) · on **Auto speak** they step that row around its three values (`off` →
 `on · here` → `on · everywhere`) · `enter` on the
 **Voice** row opens the picker · `s` speaks the last agent message in the selected voice · `esc`
-closes the panel (or returns from the picker). A pinned voice is marked on the Voice row
-(`Everly ★`).
+closes the panel from either view — Esc is the host's own binding, applied before an extension is
+asked — while **`b`** is how the voice picker returns to this view. A pinned
+voice is marked on the Voice row (`Everly ★`).
 
-Those keys are the panel's footer. Its last row belongs to the body and names what is running:
+The footer names what the panel cannot show by itself — `enter`, `s`, `f`, `b`, `esc`, and the
+left/right that adjusts a dial — and says nothing about `↑`/`↓`: a cursor that moves under them needs no
+legend (the owner's ruling, ADR-0021). The panel's last row belongs to the body and names what is
+running:
 `zot-speaks v<version>`, taken from the build itself and right-aligned, so it reads as a caption and
 not as a sixth setting. Installing an update is the main way this extension changes under someone, and
 the panel is where you find out whether it landed. Like the body, every footer row stays within 70
@@ -82,8 +86,10 @@ Choose a voice (4 ready of 37 en voices)
   ./ptts --voice "Alfie" "hi"
 ```
 
-Picker keys: `up`/`down` move (and preview) · `enter` picks · `s` speaks the last message in the
-highlighted voice · **`f` pins or unpins the highlighted voice as a favorite** · `esc` returns.
+Picker keys: `↑`/`↓` move (and preview) · `enter` picks · `s` speaks the last message in the
+highlighted voice · **`f` pins or unpins the highlighted voice as a favorite** · `b` returns to the
+main view; `esc` closes the panel, because the host spends
+Esc on closing before the extension ever sees it.
 `f` moves only that one voice: it drops to the favorite block at the top (or back out of it), the
 rest of the list keeps the catalog's order, and the cursor stays on the voice you pressed it on.
 
@@ -116,7 +122,7 @@ Hello, my name is Juniper. Warm, expressive voice with a bright, agile delivery�
 * A `(not downloaded)` voice has no embedding to synthesize, so landing on it goes quiet instead
   of leaving the previous voice talking — and it is never selected.
 * `s` speaks the **last agent message** in the highlighted voice: a longer audition than an
-  introduction, in a voice you have not committed. `esc` back to the main view, or closing the
+  introduction, in a voice you have not committed. `b` back to the main view, or closing the
   panel, stops whatever is speaking.
 * `f` re-auditions the voice it just pinned — hearing it is how you know the pin landed.
 * On the main view a **Volume** or **Speed** change is followed by the selected voice saying its own

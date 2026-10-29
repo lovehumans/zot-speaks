@@ -3,6 +3,10 @@
 //! zot panels are plain text: a `title`, a list of body `lines`, and a `footer`. The host sends
 //! normalized `panel_key` events (`up`, `down`, `left`, `right`, `enter`, `esc`, …, or `rune`
 //! with a `text` character). We edit `Settings` live and hand back frames the caller serialises.
+//! A footer names only what the panel does not already show. The arrow pair is not spelled at all,
+//! in either view: a cursor that moves under `↑`/`↓` needs no legend, and that is the owner's ruling
+//! (ADR-0021). What the footers do name is `enter`, `s`, `f`, `b`, `esc`, and the left/right that
+//! adjusts the focused dial.
 //!
 //! Main view — cursor over five rows (Voice, Volume, Speed, Temperature, Auto speak):
 //!   up/down      move the cursor
@@ -13,7 +17,9 @@
 //!                they step a three-value ring: off -> on · here -> on · everywhere -> off.
 //!   enter        open the voice picker when the cursor sits on Voice
 //!   s            speak the last agent message in the selected voice (a voice audition)
-//!   esc          close the panel
+//!   esc          close the panel — and this one is the host's key rather than ours. zot binds Esc
+//!                to closing an extension panel, sends us `panel_close`, and never delivers
+//!                `panel_key esc` at all, so no view can decide what Esc means.
 //!
 //! Voice picker — cursor over every catalog voice in the model's language, in three blocks
 //! separated by a blank line: favorites (pinned with `f`), then ready voices, then
@@ -22,7 +28,9 @@
 //!   enter        select the highlighted ready voice and return to the main view
 //!   s            speak the last agent message in the highlighted voice
 //!   f            pin/unpin the highlighted voice as a favorite (it joins the block at the top)
-//!   esc          return to the main view
+//!   b            return to the main view. The picker's way back has to be a key zot forwards:
+//!                Esc closes the panel from either view, so the footer names `b` and nothing else.
+//!                `left` is not a way back — one view away it adjusts the focused dial.
 //! Not-downloaded voices are listed but greyed as `(not downloaded)`; selecting one is a no-op
 //! that instead shows the `./ptts --voice …` command that would fetch it, and moving onto one
 //! only silences the previous voice.
@@ -234,9 +242,7 @@ impl SettingsPanel {
         // changes the panel height when you move between rows.
         match self.mode {
             Mode::Main => match self.focus {
-                VOICE_ROW => {
-                    "up/down move   enter choose voice   s last message   esc close".to_string()
-                }
+                VOICE_ROW => "enter choose voice   s last message   esc close".to_string(),
                 TEMPERATURE_ROW => {
                     "arrows or -/+ (audible)   s last message   · repeats while selected"
                         .to_string()
@@ -244,11 +250,15 @@ impl SettingsPanel {
                 AUTO_SPEAK_ROW => {
                     "left/right off · here · everywhere   s last message   esc close".to_string()
                 }
-                _ => "up/down move   arrows or -/+ (audible)   s last message   esc close"
-                    .to_string(),
+                _ => "arrows or -/+ (audible)   s last message   esc close".to_string(),
             },
             Mode::Voice => {
-                "up/down preview   enter pick   s last message   f favorite   esc back".to_string()
+                // Four clauses, 44 columns against the `DETAIL_WIDTH` cap (70), so this row never
+                // wraps and never changes the panel height between views. No arrow clause (ADR-0021:
+                // row selection is obvious from the cursor), and no `esc` — the main footers already
+                // say what the host spends Esc on. `s` is spelled out here rather than left to the
+                // main footers: auditioning the last message is not visible on this screen at all.
+                "enter pick   s last message   f fav   b back".to_string()
             }
         }
     }
@@ -520,15 +530,24 @@ impl SettingsPanel {
                     }
                     None => stay(None),
                 },
+                // The way back up, named by the footer as `b back`.
+                "b" => self.back_to_main(),
                 _ => stay(None),
             },
-            "esc" => {
-                self.mode = Mode::Main;
-                // Leaving the picker should not leave a voice talking in the main view.
-                stay(Some(Preview::Silence))
-            }
+            // Answered for a host that forwards Esc. zot does not (see the module docs), so in
+            // practice `b` is the only way here.
+            "esc" => self.back_to_main(),
             _ => stay(None),
         }
+    }
+
+    /// Leave the picker for the main view, silencing whatever it was previewing. `left` is
+    /// deliberately absent: one view away it adjusts the focused dial, and the owner ruled it out as
+    /// a hidden second exit rather than leave two ways back in reach of the same arrow.
+    fn back_to_main(&mut self) -> KeyOutcome {
+        self.mode = Mode::Main;
+        // Leaving the picker should not leave a voice talking in the main view.
+        stay(Some(Preview::Silence))
     }
 
     /// What the highlighted picker voice should say: itself when we can synthesize it, silence
@@ -943,12 +962,70 @@ mod tests {
         });
         panel.on_key("enter", "");
         assert_eq!(
-            preview_of(panel.on_key("esc", "")),
+            preview_of(panel.on_key("rune", "b")),
             Some(Preview::Silence),
             "backing out must stop the voice"
         );
-        // And closing the panel outright is the caller's cue to stop as well.
+        // Closing outright must stop it too. In zot that arrives as `panel_close` rather than as
+        // this key — section 10 of `dev/test-panel.sh` is what exercises that path — but our own
+        // `esc` arm is the same outcome for a host that does forward it.
         assert!(matches!(panel.on_key("esc", ""), KeyOutcome::Close));
+    }
+
+    /// zot owns Esc: it closes an extension panel itself and sends `panel_close`, so a sub-view
+    /// cannot be backed out of with it. The picker's way back is the key its footer names.
+    #[test]
+    fn the_picker_has_a_back_key_the_host_forwards() {
+        let mut panel = open_picker();
+        assert!(panel.title().starts_with("Choose"), "not in the picker");
+        assert_eq!(
+            preview_of(panel.on_key("rune", "b")),
+            Some(Preview::Silence),
+            "`b` must stop the voice being previewed"
+        );
+        assert_eq!(
+            panel.title(),
+            "TTS settings",
+            "`b` did not return to the main view"
+        );
+
+        // `left` is not a second way back: one view away it adjusts the focused dial, and two exits
+        // for the same arrow is a coin flip. In the picker it now does nothing at all.
+        let mut panel = open_picker();
+        assert_eq!(
+            preview_of(panel.on_key("left", "")),
+            None,
+            "`left` must not nudge a picker row"
+        );
+        assert!(
+            panel.title().starts_with("Choose"),
+            "`left` left the picker"
+        );
+
+        // `esc` is still answered, for a host that forwards it. In zot it never arrives: closing
+        // from the picker is `panel_close`, which section 10 of `dev/test-panel.sh` exercises.
+        let mut panel = open_picker();
+        assert_eq!(
+            preview_of(panel.on_key("esc", "")),
+            Some(Preview::Silence),
+            "`esc` must stop the voice being previewed"
+        );
+        assert_eq!(
+            panel.title(),
+            "TTS settings",
+            "`esc` did not return to the main view"
+        );
+    }
+
+    /// The picker, entered from a ready voice, so its first frame is already auditioning that voice.
+    fn open_picker() -> SettingsPanel {
+        let mut panel = SettingsPanel::new(catalog());
+        panel.open(&Settings {
+            voice: "Miles".into(),
+            ..Settings::default()
+        });
+        panel.on_key("enter", "");
+        panel
     }
 
     #[test]
@@ -1067,17 +1144,45 @@ mod tests {
                 "footer wraps at {} columns: {footer}",
                 footer_width(&footer)
             );
+            // The owner's ruling (ADR-0021): a footer says nothing about the arrows that move the
+            // cursor. The cursor is right there, and a clause for the obvious costs attention.
+            assert!(
+                !footer.contains("↑/↓") && !footer.contains("up/down") && !footer.contains("move"),
+                "footer explains row selection, which the panel already shows: {footer}"
+            );
             panel.on_key("down", "");
         }
+        // The cursor is back on the Voice row, where `enter` will be pressed next: that footer is
+        // the one that already tells the user what Esc is for, so the picker need not repeat it.
+        assert!(
+            panel.footer().contains("esc close"),
+            "the row the picker is entered from hides the close key: {}",
+            panel.footer()
+        );
         panel.on_key("enter", ""); // picker
         let footer = panel.footer();
         assert!(
-            footer.contains("preview") && footer.contains("s last message"),
-            "{footer}"
+            !footer.contains("↑/↓") && !footer.contains("move"),
+            "the picker footer explains row selection: {footer}"
         );
         assert!(
-            footer.contains("f favorite"),
+            footer.contains("enter pick"),
+            "the picker hides what commit does: {footer}"
+        );
+        assert!(
+            footer.contains("f fav"),
             "the picker must advertise pinning: {footer}"
+        );
+        // The 1.9.0 UX bug: the footer promised "esc back" while zot, which binds Esc to closing
+        // an extension panel, never sends `panel_key esc` at all. The picker names the key that
+        // works; the main footers above name the one the host spends on closing.
+        assert!(
+            footer.contains("b back"),
+            "the picker hides the real way back: {footer}"
+        );
+        assert!(
+            !footer.contains("esc back") && !footer.contains("left back"),
+            "the picker promises a back key the host intercepts or the panel means elsewhere: {footer}"
         );
         assert!(
             footer_width(&footer) <= DETAIL_WIDTH,
@@ -1644,7 +1749,7 @@ mod tests {
         );
 
         // Back on the main row, a pinned selection is marked.
-        panel.on_key("esc", "");
+        panel.on_key("rune", "b");
         assert!(
             panel.lines()[0].contains("Miles ★"),
             "{:?}",

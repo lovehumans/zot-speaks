@@ -49,11 +49,12 @@ The settings panel:
   Auto speak   off
 ```
 
-`up`/`down` move, `left`/`right` adjust the focused row, `enter` opens the voice picker, `s`
-speaks the last message in the highlighted voice, `esc` closes. Volume and Speed changes speak the
-selected voice at the new level or rate, and while the **Temperature** row is selected it keeps
-saying what it does — *Temperature adds variety to how a sentence is pronounced.* — repeating until
-you move off it. In the picker, moving the cursor
+`↑`/`↓` move, `left`/`right` adjust the focused row, `enter` opens the voice picker, `s`
+speaks the last message in the highlighted voice, `esc` closes the panel. Backing out of the
+picker uses `b`: zot binds Esc to closing an extension panel itself, so no view of the panel can
+claim it. Volume and Speed changes speak the selected voice at the new level or rate, and while
+the **Temperature** row is selected it keeps saying what it does — *Temperature adds variety to
+how a sentence is pronounced.* — repeating until you move off it. In the picker, moving the cursor
 **says each voice out loud** (ready voices only), `f` pins a favourite, and voices whose embedding
 is not in your cache yet are listed greyed as `not downloaded`; the bootstrap section below gives
 the command that fetches them.
