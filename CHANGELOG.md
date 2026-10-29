@@ -6,6 +6,27 @@ published CI feeds that section to `gh release create --notes-file`. A Release's
 afterwards; a published tag cannot — which is why the notes live in a tracked file instead of in the
 tag message.
 
+## v1.9.1 — The voice picker has a way back: `b`
+
+* **`b` returns from the voice picker to the settings page.** The picker's footer had promised
+  `esc back`, but zot binds Esc to closing an extension panel and answers it itself: an extension is
+  never sent a `panel_key esc` at all, so Esc closed the whole panel from either view and someone
+  browsing the list of voices had no way back. `b` is a key the host does forward. (ADR-0021)
+* **The picker footer reads `enter pick   s last message   f fav   b back`.** It names only what the
+  screen cannot show by itself: `f favorite` has become `f fav`, the `s` hint stays, and no clause
+  explains that the arrows move the cursor — the cursor is right there to be moved. 44 of the 70 columns
+  the row is capped at, so the panel still never changes height between views.
+* **The settings-page footers drop the same clause** — `↑/↓ move …` is gone from the Voice row, and from
+  Volume and Speed. Nothing else there changes: `arrows or -/+ (audible)`, `· repeats while selected`,
+  `left/right off · here · everywhere`, `esc close` all stay.
+* **`esc` closes the panel, from the picker as well as from the main view** — which is what it always
+  did. Whatever voice was previewing still stops on the way out.
+* Under the hood, with no change to settings, model, player or protocol: the panel harness had been
+  playing the host badly. It forwarded `esc` to the extension, so every panel check passed while the
+  shipped panel stranded the user. It now presses `b` where it means "leave the picker", and sends
+  `panel_close` the way the host does, so a preview started inside the picker is asserted to end with
+  the panel rather than with a key nobody sends.
+
 ## v1.9.0 — One player: `ffplay`, and ffmpeg is a prerequisite
 
 * **`ffplay` is the only player, and ffmpeg is a prerequisite rather than a preference.** The second
