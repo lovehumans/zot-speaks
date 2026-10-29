@@ -334,6 +334,37 @@ Two filters decide what is offered:
    with the `./ptts` command that would fetch them. That availability is decided when `zot-speaks`
    starts: the catalog is read once, at startup, so a voice you fetch while zot is already running
    joins the picker on the next zot start, not in the session that fetched it.
+
+## Tuning the inference
+
+**`ZOT_TTS_THREADS=<n>`** sets how many worker threads inference may use. It is exported as
+`RAYON_NUM_THREADS`, because that is the variable the pool actually reads: `ptts` parallelises
+through `xn`, whose work-stealing pool is rayon's, and rayon sizes that pool from `RAYON_NUM_THREADS`
+— and fixes its width the first time it is used, which is why the pin is applied before the model is
+loaded rather than per request.
+
+The default is one worker per **physical** core: the distinct (`physical id`, `core id`) pairs in
+`/proc/cpuinfo`, clamped to what `available_parallelism()` reports — 8 here, on a Ryzen 7 7800X3D with 16
+logical CPUs. A kernel that names no core ids (some ARM ones do not) gets the logical count instead.
+`ZOT_TTS_THREADS=<n>` overrides the rule with any positive number, larger than the core count if you know
+your box better; `0` or a value that does not parse is not a pin, and the rule is used without saying so.
+The `OMP_NUM_THREADS` and `ORT_*` variables the same function still exports alongside `RAYON_NUM_THREADS`
+are read by nothing in the dependency tree (there is no ONNX Runtime in `Cargo.lock`), so a pin written
+into them changes nothing — which is exactly what this extension did before 2026-10-29.
+
+Measured through the extension's own library path (`examples/stream_smoke.rs`, one 8.00 s utterance, 3
+reps per point): time to first sound 29–32 ms at 8 workers, 33–39 ms at 4, 49–52 ms at 16, 83–102 ms at 2,
+and 505–515 ms / 547–597 ms / 923–959 ms / 801–837 ms end to end for those counts. One worker per logical
+CPU is the worst point on an SMT box — a hyperthread adds dispatch and no throughput to a vectorised
+gemm. The same rule through the `ptts` CLI on the shipped `Quant::F32` weights (7.68 s sentence, voice
+`Miles`, seed `42`, temperature `0.3`) reads 33–35 ms at 8 threads, 38–40 at 4, 44–57 at 16, 103–115 at 1.
+Peak RSS stays in a 300–380 MB band at every count tried — 301–308 MB at 1 worker, 334–341 MB at 8 and
+320–336 MB at 16 in the most recent three-run pass — so this knob is about latency rather than memory: a
+single worker is the quietest setting measured here and two to three times slower to first sound.
+
+Why there is no sibling `ZOT_SPEAKS_QUANT`, and what quantization would buy, is in
+[Quantization.md](Quantization.md).
+
 ## Naming and installed state
 
 The manifest `name` in `extension.json` must match the `name` the extension sends in its own
@@ -387,10 +418,13 @@ crate cache, not a source problem.
   time-stretch: it cannot repair prosody, and the artifacts it does introduce are ffmpeg's. A
   player-independent stretch (WSOLA or a phase vocoder in our own write path) would free the setting
   from `ffplay` and from `paplay`'s silence about it. Not scheduled.
-* **Quantisation is untried.** The Rust API exposes `Quant` (`q8_0`, `q4k`, CPU-only) and `ptts`
-  exposes `--quant`; this extension uses `Quant::F32`. Worth measuring before changing it.
-  Note that the shipped model weights are what your cache holds — a quantised build needs the
-  matching weights file locally.
+* **Quantisation is measured, and declined.** The Rust API exposes `Quant` (`q8_0`, `q4k`, CPU-only)
+  and `ptts` exposes `--quant`; this extension uses `Quant::F32`. On this box `q8_0` saves about 50 MB
+  of peak memory and costs the first sound — roughly 4 ms at 8 threads, 15–17 ms at 16 — so it is
+  neither shipped nor exposed. [Quantization.md](Quantization.md) holds the matrix, the controls, and
+  the recipe for re-measuring on a box where memory binds instead of latency. Note that a quantised
+  build needs the matching weights file locally: the extension reads the cache and never downloads
+  one.
 * **Auto speak needs a session that outlives its turn.** `turn_end` and `shutdown` arrive together
   when zot is run one-shot (`zot -p "…"`, or a prompt on a pipe), so there is no time left to
   synthesize and play before the host tears the extension down; auto speak is an interactive-session

@@ -15,7 +15,7 @@ machine. No network access, no account, no cloud voice.
 | ✅ Fully offline | ❌ Cloud / online TTS of any kind, network access |
 | ✅ CPU-only inference → the GPU stays free for your local LLM | ❌ Telemetry, accounts, anything that phones home |
 | ✅ A small English model, `gradium/phonon-31m-en`, with 37 voices | ❌ Voice cloning |
-| ✅ Instant streaming audio |  |
+| ✅ Audio streams as it is generated, and stops cleanly |  |
 | ✅ Pitch-invariant speed control | |
 | ✅ Auto-speak of the final answer, scoped per project | |
 
@@ -67,6 +67,10 @@ the pitch. `paplay` has no tempo flag, so `ZOT_SPEAKS_SINK=paplay` always speaks
 **Repeats are new takes.** Every utterance is synthesized from its own noise seed, so saying the same
 line twice is not a replay — which is what makes the Temperature row audible as you step it. Set
 `ZOT_SPEAKS_SEED=42` in the environment when you want a session's utterances reproducible in order.
+
+**Threads.** Inference uses one worker per physical core. Set `ZOT_TTS_THREADS=<n>` to override that on a
+machine you know — `1` is the smallest and quietest setting measured, at two to three times the time to
+start speaking. The numbers behind both rules are in *Tuning the inference* in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Install
 
