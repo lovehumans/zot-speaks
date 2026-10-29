@@ -6,6 +6,28 @@ published CI feeds that section to `gh release create --notes-file`. A Release's
 afterwards; a published tag cannot — which is why the notes live in a tracked file instead of in the
 tag message.
 
+## v1.8.2 — One worker per physical core
+
+* **Inference now asks for one worker thread per physical core, not per logical CPU.** The request is
+  made through `RAYON_NUM_THREADS`, which is the variable the inference pool actually reads. Until now
+  the extension set `OMP_NUM_THREADS`, and nothing in the dependency tree reads that: the request was
+  ignored, and the pool took every logical CPU it could find.
+* **What that costs on an SMT box is measured, on this machine** (8 physical cores / 16 logical CPUs, the
+  shipped `f32` weights, `examples/stream_smoke.rs`, one 6.7 s utterance, three runs each): **40–45 ms to
+  the first sound and 392–402 ms end to end at 8 workers, against 51–70 ms and 718–746 ms at 16** — about
+  1.8x end to end. Peak memory is not part of this trade: the same runs peak at 334–341 MB with 8 workers
+  and 320–336 MB with 16, a band rather than a lever. A machine without SMT names the same number of
+  physical and logical CPUs, so it is unaffected.
+* **`ZOT_TTS_THREADS=<n>` pins the width and is now documented.** Any positive number overrides the rule
+  for someone who knows their box. `1` is the smallest and quietest setting measured — 301–308 MB of peak
+  RSS against 334–341 MB at 8 workers — at two to three times the time to first sound. A value that does
+  not parse is not a pin, and the physical-core rule is used instead.
+* **New docs: *Tuning the inference* in `docs/DESIGN.md`, and `docs/Quantization.md`.** The latter records
+  why full-precision weights stay shipped: `q8_0` measured 50–66 MB lighter at 8 workers with first sound
+  no earlier, and it produced a different take rather than a degraded one, so quantization is not shipped
+  and has no setting.
+* The panel's identity row and `extension.json` now read `1.8.2`.
+
 ## v1.8.1 — The Temperature row says what it does
 
 - The **Temperature** row now speaks while it is the selected row, in the voice you picked:
