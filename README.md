@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="zot_speaks.jpeg" width="200" alt="zot-speaks">
+</div>
+
 # zot-speaks
 
 A [zot](https://www.zot.sh) extension that speaks the last agent message aloud, using

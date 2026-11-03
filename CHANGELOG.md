@@ -6,6 +6,12 @@ published CI feeds that section to `gh release create --notes-file`. A Release's
 afterwards; a published tag cannot — which is why the notes live in a tracked file instead of in the
 tag message.
 
+## v1.9.2 — The README opens with a logo
+
+- README leads with the project logo, `zot_speaks.jpeg` (1254×1254, centered at 200 px wide). The image is
+  part of the published artifact, so a plain clone shows it too, not only the GitHub page.
+- No behaviour change: the sources, settings format, model, player and protocol are the ones 1.9.1 shipped.
+
 ## v1.9.1 — The voice picker has a way back: `b`
 
 * **`b` returns from the voice picker to the settings page.** The picker's footer had promised
