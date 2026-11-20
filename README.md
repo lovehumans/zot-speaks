@@ -22,6 +22,7 @@ machine. No network access, no account, no cloud voice.
 | ✅ Audio streams as it is generated, and stops cleanly |  |
 | ✅ Pitch-invariant speed control | |
 | ✅ Auto-speak of the final answer, scoped per project | |
+| ✅ A `voice-mode` skill that teaches the agent to phrase answers for speech | ❌ Applying that skill on its own initiative: it runs only when you invoke or pin it |
 
 Phonon is a 31 M-parameter model: natural speech with imperfect prosody, not a commercial studio
 voice. Output is mono 24 kHz, streamed into `ffplay`'s stdin while it is being generated.
@@ -42,6 +43,7 @@ voice. Output is mono 24 kHz, streamed into `ffplay`'s stdin while it is being g
 | `/tts` | Speak the most recent agent message. |
 | `/tts stop` | Cut the current utterance off cleanly — no audio tail. |
 | `/tts-settings` | Open a panel to pick voice, volume, temperature, speed and auto-speak. |
+| `/skill:zot-speaks:voice-mode` | Ask the agent to phrase its answers for speech (see *Voice mode*). |
 
 The settings panel:
 
@@ -65,6 +67,21 @@ the command that fetches them.
 
 Auto-speak reads the agent's final answer aloud when a turn ends. It is scoped per project, and
 the row cycles `off → here → everywhere`.
+
+Sending a new message cuts off whatever is still being read out — an auto-spoken answer, a `/tts`, a
+voice audition. Quietly: typing the message is already the reason, so nothing is reported about it,
+unlike `/tts stop`, which you asked for by name.
+
+**Voice mode** is a skill the extension ships (`skills/voice-mode/SKILL.md`): it tells the agent to
+close a turn in phrasing a phonemizer handles — short sentences with full stops in them, prose
+instead of markdown, no quoted code, no commit hashes, capitals only where they change how a word
+is said (`TTS`, but `readme`),
+counts instead of lists of names, one question at a time. It is **user-invoked**: the agent
+never picks it up by itself, and auto-speak does not imply it. Run
+`/skill:zot-speaks:voice-mode`, or open `/skills` and press `p` to **pin the skill to the
+project** — from then on every fresh conversation in that project starts with it, which is the
+setting worth choosing if you always speak. A pin applies to fresh conversations, not to the one
+already running.
 
 **Speed** is a tempo setting, which stretches the time without shifting
 the pitch: it is handed to `ffplay` as ffmpeg's `atempo` filter, never re-timed in the extension.
@@ -98,7 +115,8 @@ just install-release                    # or pin one: just install-release v1.7.
 
 Then run `just bootstrap` once, before your first `/tts`: `zot-speaks` only ever reads the
 Hugging Face cache, so speech stays silent — with a loud warning about the missing snapshot —
-until it is filled. See [One-time bootstrap](#one-time-bootstrap) below.
+until it is filled. `just bootstrap` drives the upstream `ptts` CLI, and `just fetch-ptts` downloads the version
+this artifact is built against if you have no `ptts` yet. See [One-time bootstrap](#one-time-bootstrap) below.
 
 Or fetch, verify and install by hand (no `just` needed):
 
@@ -125,14 +143,17 @@ download, and you can cross-check the printed hash against the release notes. To
 instead of taking the newest, replace `latest` with the tag in both URLs:
 `releases/download/v1.7.8/…`.
 
-Restart zot: `zot ext doctor` should list `zot-speaks` with `/tts` and `/tts-settings` active.
+Start zot, or run `/reload-ext` in a session that is already running: `zot ext doctor` should list
+`zot-speaks` with `/tts` and `/tts-settings` active.
 
 **Updating.** Swap the new files inside the installed directory; your settings (voice, favourites,
 per-project auto-speak) live in `settings.json` there and travel untouched. `just update-release`
 downloads the binary **and the `extension.json` manifest** the Release publishes, verifies both
 against its `SHA256SUMS`, and swaps them; `just update-ext` does the same from a source build. The
 manifest matters because zot reads it at load: `zot ext list` reports the version *it* says, so a
-swap that carries only the binary leaves an installation advertising a version it does not run.
+swap that carries only the binary leaves an installation advertising a version it does not run. In a
+session already running, `/reload-ext` is what picks the swap up: zot re-reads every manifest, respawns
+the subprocesses and rebuilds its tool registry, which means it cancels the turn in progress first.
 Releases before v1.7.15 publish the binary alone, and then the recipe says so instead of pretending.
 The `/tts-settings` panel reports the same identity on its last row, so the version you are actually
 running is readable without leaving zot.
@@ -224,8 +245,9 @@ test it, let me know!
 ### One-time bootstrap
 
 `zot-speaks` never downloads: it only reads the Hugging Face cache. Filling that cache is the one
-network step, and it needs the upstream `ptts` CLI in the cloned `zot-speaks` dir or on your `PATH` — get it from the [official
-releases](https://github.com/gradium-ai/xn-ptts/releases).
+network step, and it needs the upstream `ptts` CLI in the cloned `zot-speaks` dir or on your `PATH` —
+`just fetch-ptts` downloads the version this artifact is built against, and the [official
+releases](https://github.com/gradium-ai/xn-ptts/releases) have every other one.
 
 ```sh
 just bootstrap   # the model (~99 MiB) plus all 37 English voices (~9 MiB), once

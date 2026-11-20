@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ptts::checkpoint::{Checkpoint, ResolveOptions};
+use ptts::comp::{GainConfig, LimiterConfig, ModuleConfig};
 use ptts::preprocess::Lang;
 use ptts::synth::{DeviceKind, Quant, SpeechOptions, Synth};
 
@@ -96,13 +97,55 @@ pub fn build_options(
     (options, used)
 }
 
-/// What the settings mean to ptts: the temperature dial, and the noise this utterance starts from.
-/// Split out from the voice lookup — which needs a loaded `Synth` — so the part a test can hold
-/// stays testable.
+/// What the settings mean to ptts: the temperature dial, the level the volume dial asks for, and the
+/// noise this utterance starts from. Split out from the voice lookup — which needs a loaded `Synth` —
+/// so the part a test can hold stays testable.
 fn speech_of(settings: &Settings, seed: u64) -> SpeechOptions {
     SpeechOptions::default()
         .temperature(settings.temperature)
         .seed(seed)
+        .post_process(post_chain(settings))
+}
+
+/// How far below full scale the limiter holds every peak. A decibel and not zero, because the stream
+/// is not finished when it leaves us: `atempo` resamples it inside the player and the system mixer
+/// adds its own gain, and a wave already touching full scale has nothing left for either to overshoot
+/// into.
+const LIMITER_HEADROOM_DB: f32 = 1.0;
+
+/// How far ahead of a peak the limiter looks. Its gain snaps down at once and releases slowly, so with
+/// no lookahead the attenuation starts *on* the transient and the waveform steps where it should
+/// glide; three milliseconds is shorter than the attack of a plosive, so the gain is already on its
+/// way down when the peak arrives. What it costs is the utterance's first `lookahead × rate` samples —
+/// 72 at 24 kHz — which are the zeros the delay line was primed with, and ptts trims them and flushes
+/// the same number out at the end.
+const LIMITER_LOOKAHEAD_MS: f32 = 3.0;
+
+/// How long the limiter takes to let the level back up once a peak has passed. Speech is a succession
+/// of peaks a few hundred milliseconds apart, so a release measured in tens of milliseconds is a pump
+/// you hear breathing between words; a hundred leaves each peak its own dip and has the gain back
+/// where it was before the next one arrives.
+const LIMITER_RELEASE_MS: f32 = 100.0;
+
+/// The volume dial as the synthesis sees it: the dial's gain, then a ceiling. Two stages, per
+/// utterance, because the dial moves between them while the loaded model stays put — these are
+/// descriptions, and ptts builds the chain from them at the model's own sample rate, runs it over each
+/// streaming chunk, and hands the chunks out already at the level the dial asked for.
+///
+/// Before this, the level was applied by the writer that produced the bytes, which could only flatten
+/// whatever came out above full scale (see `sink::sample_to_s16`). Flattened peaks are what the top of
+/// the dial sounded like.
+pub fn post_chain(settings: &Settings) -> Vec<ModuleConfig> {
+    vec![
+        ModuleConfig::Gain(GainConfig {
+            gain_db: settings.gain_db(),
+        }),
+        ModuleConfig::Limiter(LimiterConfig {
+            lookahead_ms: LIMITER_LOOKAHEAD_MS,
+            headroom_db: LIMITER_HEADROOM_DB,
+            release_ms: LIMITER_RELEASE_MS,
+        }),
+    ]
 }
 
 /// `ZOT_SPEAKS_SEED` pins the noise sequence: set it to a number and the utterances of a run are
@@ -255,6 +298,218 @@ fn physical_cores_from_cpuinfo(text: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ptts::comp::{AudioModule, Chain, Gain};
+
+    /// How far above the ceiling a limited signal is allowed to land, in the tests below: a tenth of a
+    /// decibel. The window that decides a sample's gain starts one sample *after* the sample it governs,
+    /// so a peak is caught by the energy around it rather than by itself, and the gain that governs it
+    /// has already started releasing back up. Before this change the same samples landed on full scale
+    /// and stayed there; a tenth of a decibel is the difference between those two stories.
+    const CEILING_SLACK: f32 = 1e-2;
+
+    /// The dial is no longer a multiplier the writer applies to the bytes: it is a gain stage and a
+    /// ceiling, in that order, and the ceiling is the part that used to be a flattening clamp.
+    #[test]
+    fn the_volume_dial_becomes_gain_then_limiter() {
+        let chain = post_chain(&Settings {
+            volume: 1.0,
+            ..Settings::default()
+        });
+        assert_eq!(chain.len(), 2, "the dial's gain, then the ceiling");
+        match &chain[0] {
+            ModuleConfig::Gain(gain) => assert!(
+                (gain.gain_db - 6.0206).abs() < 1e-3,
+                "100% is twice the level, which is +6 dB, not {}",
+                gain.gain_db
+            ),
+            other => panic!("the first stage must be the gain, not {other:?}"),
+        }
+        match &chain[1] {
+            ModuleConfig::Limiter(limiter) => assert_eq!(
+                (
+                    limiter.lookahead_ms,
+                    limiter.headroom_db,
+                    limiter.release_ms
+                ),
+                (
+                    LIMITER_LOOKAHEAD_MS,
+                    LIMITER_HEADROOM_DB,
+                    LIMITER_RELEASE_MS
+                ),
+                "the ceiling is the one this module documents"
+            ),
+            other => panic!("the second stage must be the limiter, not {other:?}"),
+        }
+        // Every request carries it, including the previews the panel auditions.
+        let options = speech_of(&Settings::default(), 3);
+        assert!(
+            options
+                .post_process
+                .as_ref()
+                .is_some_and(|chain| chain.len() == 2),
+            "an utterance built from settings carries the chain"
+        );
+    }
+
+    /// `0%` has to stay silence, and nothing downstream of this chain multiplies the samples any more.
+    /// `0 dB` is not a decibel silence can be expressed in, so this is the one rung that has to be
+    /// checked where the multiplication happens.
+    #[test]
+    fn zero_percent_silences_through_the_gain_stage() {
+        let ModuleConfig::Gain(gain) = &post_chain(&Settings {
+            volume: 0.0,
+            ..Settings::default()
+        })[0] else {
+            panic!("the first stage is the gain");
+        };
+        let mut samples = vec![0.5, -0.5, 1.0];
+        Gain::new(gain.gain_db).process(&mut samples);
+        assert_eq!(samples, vec![0.0, 0.0, 0.0], "0% is silence");
+    }
+
+    /// The claim the whole swap rests on, on a signal hot enough to have been flattened: a peak meets
+    /// a ceiling and the wave keeps its shape, where the clamp used to pin it to full scale.
+    ///
+    /// One second of 1 kHz tone, at `0.3` of full scale except for a hundred milliseconds at `3.0` —
+    /// four times full scale before the gain, twelve times after it at `100%`.
+    #[test]
+    fn a_peak_meets_a_ceiling_instead_of_a_flat_top() {
+        let rate: u32 = 24_000;
+        let raw: Vec<f32> = (0..rate)
+            .map(|i| {
+                let t = i as f32 / rate as f32;
+                let amplitude = if (0.05..0.15).contains(&t) { 3.0 } else { 0.3 };
+                amplitude * (2.0 * std::f32::consts::PI * 1000.0 * t).sin()
+            })
+            .collect();
+
+        let mut chain = Chain::from_modules(
+            rate,
+            &post_chain(&Settings {
+                volume: 1.0,
+                ..Settings::default()
+            }),
+        );
+        let trimmed = chain.latency();
+        assert_eq!(
+            trimmed,
+            (LIMITER_LOOKAHEAD_MS * 0.001 * rate as f32).round() as usize,
+            "the lookahead is the delay the streaming path trims off the head"
+        );
+        let mut out = raw.clone();
+        chain.process(&mut out);
+        // What the streaming path hands out: the primed zeros off the head, so output index `i` is
+        // input sample `i` at the gain the limiter had when it saw the lookahead window ahead of it.
+        let out = &out[trimmed..];
+
+        let ceiling = 10f32.powf(-LIMITER_HEADROOM_DB / 20.0);
+        assert!(
+            out.iter()
+                .all(|sample| sample.abs() <= ceiling + CEILING_SLACK),
+            "nothing may pass the ceiling: worst was {}",
+            out.iter().fold(0.0f32, |worst, s| worst.max(s.abs()))
+        );
+        let peak = out.iter().fold(0.0f32, |best, s| best.max(s.abs()));
+        assert!(
+            peak > ceiling - CEILING_SLACK,
+            "the ceiling has to be where the peaks actually land, and the peak here is {peak}"
+        );
+
+        // What the old clamp did with the same samples: twice the level, then everything above full
+        // scale flattened against it. That is the difference, counted.
+        let clamped: Vec<f32> = raw
+            .iter()
+            .take(out.len())
+            .map(|s| (s * 2.0).clamp(-1.0, 1.0))
+            .collect();
+        let flattened = clamped.iter().filter(|s| **s >= 1.0).count();
+        let limited = out
+            .iter()
+            .filter(|s| **s >= ceiling - CEILING_SLACK)
+            .count();
+        assert!(
+            flattened > 1000,
+            "this signal must be hot enough for the clamp to have visibly flattened it: {flattened}"
+        );
+        assert!(
+            limited * 10 < flattened,
+            "a limiter touches the ceiling on its way past it ({limited} samples), where the clamp \
+             pinned the whole passage to it ({flattened})"
+        );
+
+        // Quiet passages are untouched, which is the other half of not pumping: the limiter acts
+        // around peaks, not around everything it is handed.
+        let quiet_index = 240; // 10 ms in, a hundred milliseconds clear of the hot passage
+        assert!(
+            (out[quiet_index] - raw[quiet_index]).abs() < 1e-6,
+            "a quiet sample must pass through unchanged: {} vs {}",
+            out[quiet_index],
+            raw[quiet_index]
+        );
+    }
+
+    /// One sample of four times full scale in the middle of a quiet stretch, twelve times that after
+    /// the `100%` gain: the lookahead cannot see a spike from the sample it governs — the window it
+    /// reads starts one sample later — so what catches it is the attenuation the limiter is still
+    /// holding from the samples *after* it.
+    #[test]
+    fn an_isolated_spike_is_held_by_the_release_not_the_lookahead() {
+        let rate = 24_000;
+        let mut samples = spike_at(rate, 3.0);
+        let mut chain = Chain::from_modules(rate, &post_chain(&dial_at(1.0)));
+        let trimmed = chain.latency();
+        chain.process(&mut samples);
+        let ceiling = 10f32.powf(-LIMITER_HEADROOM_DB / 20.0);
+        let worst = samples[trimmed..]
+            .iter()
+            .fold(0.0f32, |w, s| w.max(s.abs()));
+        assert!(
+            worst <= ceiling + CEILING_SLACK,
+            "a spike twelve times full scale must still be stopped at the ceiling: it reached {worst}, \
+             the ceiling is {ceiling}"
+        );
+    }
+
+    /// The same spike, the same lookahead, a release of one millisecond instead of a hundred: by the
+    /// time the spike itself is emitted the gain has already let go, and it lands above full scale —
+    /// which is the writer's clamp being needed again, flattened against it. This is why
+    /// `LIMITER_RELEASE_MS` is a hundred milliseconds and not something quicker.
+    #[test]
+    fn a_release_shorter_than_the_lookahead_lets_the_spike_through() {
+        let rate = 24_000;
+        let mut samples = spike_at(rate, 3.0);
+        let mut modules = post_chain(&dial_at(1.0));
+        modules[1] = ModuleConfig::Limiter(LimiterConfig {
+            lookahead_ms: LIMITER_LOOKAHEAD_MS,
+            headroom_db: LIMITER_HEADROOM_DB,
+            release_ms: 1.0,
+        });
+        let mut chain = Chain::from_modules(rate, &modules);
+        let trimmed = chain.latency();
+        chain.process(&mut samples);
+        let worst = samples[trimmed..]
+            .iter()
+            .fold(0.0f32, |w, s| w.max(s.abs()));
+        assert!(
+            worst > 1.0,
+            "a release quicker than the lookahead must let the spike past full scale: {worst}"
+        );
+    }
+
+    /// One second of `0.05` with one sample of `spike` in the middle.
+    fn spike_at(rate: u32, spike: f32) -> Vec<f32> {
+        let mut samples = vec![0.05; rate as usize];
+        samples[(rate / 2) as usize] = spike;
+        samples
+    }
+
+    /// Settings at a given rung of the volume dial.
+    fn dial_at(volume: f32) -> Settings {
+        Settings {
+            volume,
+            ..Settings::default()
+        }
+    }
 
     /// The Temperature row's whole claim rests on this: each utterance of the same sentence starts
     /// from new noise, so the takes differ in the way the setting says they should.

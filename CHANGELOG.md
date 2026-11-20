@@ -6,11 +6,65 @@ published CI feeds that section to `gh release create --notes-file`. A Release's
 afterwards; a published tag cannot — which is why the notes live in a tracked file instead of in the
 tag message.
 
+## v1.10.0 — A `voice-mode` skill, and a volume dial that limits instead of clipping
+
+- **The extension ships a skill** (`skills/voice-mode/SKILL.md`): a phrasing guide for answers that will be read
+  aloud — short sentences with full stops in them, prose instead of markdown, no quoted code, no commit hashes,
+  capitals only where they change how a word is said (`TTS`, but `readme`), a version number written the way it is
+  said (`1 dot 10 dot 0`, not `1.10.0`), counts instead of lists of names, one question at a time. It is
+  **user-invoked**: the agent never picks it up on its own initiative and auto-speak does not imply it. Run
+  `/skill:zot-speaks:voice-mode`, or open `/skills` and press `p` to pin it to the project, which is the setting
+  worth choosing if you always speak (a pin applies to fresh conversations). Every install and update recipe carries
+  `skills/` next to the manifest, and an update clears the installed skills directory first, so a skill that has
+  been removed cannot linger.
+- **The volume dial means what it always meant and now does less damage.** `50%` is still the voice at its own
+  level and `100%` twice that level; what changed is where the scaling happens. It used to be a multiplier with a
+  hard clamp in the audio writer; it is now a gain stage in decibels followed by a look-ahead limiter inside the
+  synthesis chain. Measured on one fixed take — voice Alfie, `ZOT_SPEAKS_SEED=42`, one 4.2 s sentence, whose raw peak is
+  0.796 FS — at `100%` the old path drove **349 samples onto full scale, 13 of them in a row**, and left them flat
+  there; the new chain leaves **0** samples at the ceiling and no flat run, its peak at 0.891 FS (−1.00 dBFS)
+  instead of pinned at 1.000 FS. Holding the peaks costs 1.7 dB of average level on that take (rms −14.70 →
+  −16.37 dBFS). At `25%` and `50%` the two paths agree sample for sample, because the limiter is idle whenever the
+  peak is already under its ceiling; on this take it starts engaging just above `55%`. The figures and the chain
+  are documented in `docs/DESIGN.md`, *Volume*.
+- **The synthesis library is ptts 0.7.1** (it was 0.4.0). Inference is still CPU-only — no CUDA, Metal, Vulkan,
+  WebGPU or Accelerate backend is enabled, and none ever will be here — and the upgrade is level-neutral: on the
+  same fixed take at `25%`, `50%`, `80%` and `100%`, peak level, the number of samples reaching the ceiling and the
+  average level are the same at every rung (the widest gap is the `80%` peak, 0.8912 against 0.8913 FS), and the
+  first sound still arrives 15–18 ms after the request. The waveforms are not bit-identical: the two agree sample
+  for sample for the first 1.25 s of the take and afterwards differ by up to 150 LSB of the raw 16-bit signal.
+- **A new recipe fetches the cache-warming helper.** `just fetch-ptts` downloads the upstream `ptts` CLI at
+  the version `Cargo.toml` names, checks the archive against that release's published `SHA256SUMS`, and installs
+  it as `./ptts` — where `just fetch-model` and `just fetch-voices` look first. The version is the point: which
+  model commit a cache warm resolves is decided by that library, and a stale `./ptts` — gitignored, so nothing
+  ever flagged it — kept warming the cache with the weights an older release pinned. Linux and macOS, four target
+  triples; Windows is told to install the CLI itself.
+- **Sending a message cuts off the answer it replaces.** The extension now subscribes to the host's
+  `user_prompt_submit` event as well, and on it asks for the same clean stop `/tts stop` gives: an
+  auto-spoken answer, a `/tts`, or a voice audition that is still playing is cut off, quietly, the moment
+  the new message is accepted. A request that had been queued but had not started is dropped rather than
+  started. `dev/test.sh` measures it: the player stops being fed 94–1716 ms after the message across five runs
+  (the harness asserts 2000 ms), while the same sentence left alone runs 2.8–2.9 s and 138 240–142 080 bytes of
+  audio — so what the cut removes is a second or more of speech. There is no setting for it and it says nothing
+  when it happens: a message always ends the talk it replaces.
+- **Nothing you have stored changes, and nothing downloads.** A `settings.json` written by 1.9.x is read exactly as
+  it was — same `settings_version`, same `volume` dial, same speed ladder — and the extension still reads the
+  Hugging Face cache without ever fetching at runtime.
+- Commands, panel, keys, the voice picker and the PCM stream are the ones 1.9.1 shipped, apart from the level chain
+  above, and apart from a new message now ending one.
+
+## v1.9.3 — A force push, and what an older clone has to do
+
+- **`main` and the tags `v1.8.0` … `v1.9.2` were rewritten, and a force push was necessary.** A clone made before
+  2026-11-11 still has those refs naming commits from before the rewrite, so a plain `git pull` does not settle them.
+- **An older clone fixes itself with** `git fetch origin --tags --force && git reset --hard origin/main`, or by
+  cloning again. Every Release keeps its text and its assets; what changed is the commit each tag names.
+- **Nothing was published under this number and no behaviour changed.** It documents git refs, not the artifact: the
+  sources, settings format, model, player and protocol each version carries are the ones it shipped with.
+
 ## v1.9.2 — The README opens with a logo
 
-- README leads with the project logo, `zot_speaks.jpeg` (1254×1254, centered at 200 px wide). The image is
-  part of the published artifact, so a plain clone shows it too, not only the GitHub page.
-- No behaviour change: the sources, settings format, model, player and protocol are the ones 1.9.1 shipped.
+- README leads with the project logo, `zot_speaks.jpeg`.
 
 ## v1.9.1 — The voice picker has a way back: `b`
 

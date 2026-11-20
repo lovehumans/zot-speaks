@@ -29,7 +29,9 @@ zot ext enable zot-speaks
 
 `just install-ext` does the same copy and enables the extension. Nothing else in the justfile
 installs anything on a Mac: `install-release` and `update-release` fetch the Linux Release asset, and
-`fetch-model`/`fetch-voices` only warm the cache of a machine that can already run the binary.
+`fetch-model`/`fetch-voices` only warm the cache of a machine that can already run the binary — which a
+Mac can, so `just fetch-ptts` works there too: it picks the `*-apple-darwin` archive for the machine's
+own architecture and installs it as `./ptts`.
 
 ## What plays
 

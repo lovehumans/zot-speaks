@@ -2,10 +2,12 @@
 //!
 //! Protocol (JSON-lines on stdin/stdout), matching zot's extension docs:
 //!   hello (extension-initiated) -> hello_ack -> register_command tts + tts-settings
-//!     + subscribe assistant_message + turn_end + ready
+//!     + subscribe assistant_message + turn_end + user_prompt_submit + ready
 //!   assistant_message events -> cache that session's latest `text`
 //!   turn_end with a final stop reason -> speak the message of the session that ended, in
 //!     projects with auto-speak on
+//!   user_prompt_submit -> cut off whatever is still playing, without a note: the user has sent a
+//!     message, so the talk that answers the one they replaced has nothing left to say
 //!   command_invoked `tts [text]` speaks; `tts stop` cuts it off
 //!   command_invoked `tts-settings` opens an interactive panel (voice/volume/temperature/auto-speak);
 //!     the panel answers for whichever project the session is currently in
@@ -22,9 +24,10 @@
 //!   * `stream_with` yields mono f32 PCM chunks, so time-to-first-audio is decoupled from length.
 //!   * The sink owns everything that reaches the player. `Sink::open` starts `ffplay` and states the
 //!     format (raw s16le mono on stdin, the speed asked of the player through ffmpeg's `atempo`
-//!     filter rather than re-timed here); `Sink::write` scales a chunk by the volume dial
-//!     (`Settings::gain`), converts it to s16le and feeds it at the player's pace; `Sink::finish`
-//!     drains or kills the player and turns what it said into a sentence. What is left here owns the
+//!     filter rather than re-timed here); `Sink::write` converts a chunk to s16le and feeds it at the
+//!     player's pace; `Sink::finish` drains or kills the player and turns what it said into a
+//!     sentence. The level is applied before the sink, in the synthesis chain (`tts::post_chain`), so
+//!     the writer is a conversion and not a volume control. What is left here owns the
 //!     utterance: what to synthesize, and when a Stop or a superseding request ends it.
 //!   * Voice and temperature go through `SpeechOptions`, resolved against the locally-registered
 //!     voice catalog, and every utterance is synthesized from its own noise seed (`tts::SeedPlan`;
@@ -237,9 +240,10 @@ fn main() {
                     "name": "tts-settings",
                     "description": "pick voice, volume, speed, temperature and auto-speak; the voice picker previews each voice as you browse, volume and speed changes audition the current voice, the Temperature row explains itself out loud while it is selected, `f` pins favorites, and the arrows on Auto speak step it off -> this project -> every project, where speaking the last agent message at the end of a turn is what changes",
                 }));
-                out.send(
-                    &json!({"type": "subscribe", "events": ["assistant_message", "turn_end"]}),
-                );
+                out.send(&json!({
+                    "type": "subscribe",
+                    "events": ["assistant_message", "turn_end", "user_prompt_submit"],
+                }));
                 out.send(&json!({"type": "ready"}));
             }
             "event" => {
@@ -264,6 +268,15 @@ fn main() {
                     }
                 }
                 match frame.get("event").and_then(Value::as_str).unwrap_or("") {
+                    // The host fires this the moment it accepts what the user typed, before the
+                    // input is appended or queued. An utterance still playing then answers a message
+                    // the user has already moved past, so it is cut off exactly the way `/tts stop`
+                    // is — and silently, because typing the message is the reason and needs no note
+                    // about it. This covers every kind of talk: an auto-spoken answer, a `/tts`,
+                    // a panel audition.
+                    "user_prompt_submit" => {
+                        let _ = tx.send(Cmd::Stop);
+                    }
                     "assistant_message" => {
                         if let Some(text) = frame.get("text").and_then(Value::as_str) {
                             messages.lock().unwrap().record(frame_session(&frame), text);
@@ -658,7 +671,7 @@ fn play_one(
     // is still working, so sound starts at the first chunk. A player that starts and then dies is not
     // a spawn failure — it is reported where it actually shows up, at the teardown.
     let speed = settings.speed;
-    let mut sink = match Sink::open(rate, speed, settings.gain()) {
+    let mut sink = match Sink::open(rate, speed) {
         Ok(sink) => sink,
         Err(e) => {
             // "Not installed", "present but not startable" and "no stdin" are three different

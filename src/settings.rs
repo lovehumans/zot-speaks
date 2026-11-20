@@ -1,9 +1,12 @@
 //! Settings state: voice, volume, temperature, favorite voices, auto-speak. Speed is omitted.
 //!
-//! `volume` is a dial, `0.0..=1.0`, shown as `0%..=100%` in 5% steps. The gain actually applied
-//! when converting f32 PCM to s16le is twice the dial (see `Settings::gain`), so the default
-//! `0.5` — displayed `50%` — is unity: the voice's own level, neither boosted nor attenuated.
-//! `100%` doubles it, which is the headroom a quiet voice needs.
+//! `volume` is a dial, `0.0..=1.0`, shown as `0%..=100%` in 5% steps. It names the gain applied to
+//! the model's PCM before it reaches the player: twice the dial, so the default `0.5` — displayed
+//! `50%` — is unity, the voice at its own level, neither boosted nor attenuated, and `100%` is
+//! +6 dB, the headroom a quiet voice needs (see `Settings::gain_db`). That gain is handed to the
+//! synthesis chain as a `Gain` stage followed by a `Limiter`, so the top of the dial pushes peaks
+//! against a ceiling a decibel below full scale rather than against a clamp that flattens them
+//! (see `tts::post_chain`).
 //! `temperature` is the noise scale of the flow-matching sampler, passed to ptts per request
 //! (0.0..=1.0, default 0.3); see `tts::build_options`.
 //! `favorites` are voices pinned with `f` in the voice picker; the panel lists them as their own
@@ -185,9 +188,11 @@ impl Settings {
             .retain(|_, on| *on != self.auto_speak);
     }
 
-    /// The multiplier applied to the PCM. `0.5` on the dial (`50%`) is unity gain.
-    pub fn gain(&self) -> f32 {
-        self.volume * VOLUME_GAIN_AT_FULL
+    /// What the dial means in decibels: `50%` is unity (`0 dB`), `100%` is `VOLUME_GAIN_AT_FULL`
+    /// (+6 dB), `25%` halves the level (-6 dB). `0%` is silence, which has no decibel value: it comes
+    /// out as `f32::NEG_INFINITY`, and a `Gain` stage multiplied by it leaves zeros.
+    pub fn gain_db(&self) -> f32 {
+        20.0 * (self.volume * VOLUME_GAIN_AT_FULL).log10()
     }
 
     pub fn is_favorite(&self, name: &str) -> bool {
@@ -560,28 +565,59 @@ mod tests {
             "the dial sits in the middle by default"
         );
         assert_eq!(
-            settings.gain(),
-            1.0,
+            settings.gain_db(),
+            0.0,
             "50% is unity gain: nothing applied to the PCM"
         );
-        assert_eq!(
+        assert!(
+            near_db(
+                Settings {
+                    volume: VOLUME_MAX,
+                    ..Settings::default()
+                }
+                .gain_db(),
+                6.0206
+            ),
+            "100% is twice the level, which is +6 dB"
+        );
+        let mute = Settings {
+            volume: VOLUME_MIN,
+            ..Settings::default()
+        }
+        .gain_db();
+        assert!(
+            mute.is_infinite() && mute.is_sign_negative(),
+            "0% is silence, and silence has no decibel value: {mute}"
+        );
+    }
+
+    /// The dial is exact; the logarithm that turns it into decibels is not.
+    fn near_db(actual: f32, want: f32) -> bool {
+        (actual - want).abs() < 1e-3
+    }
+
+    #[test]
+    fn the_dial_walks_in_decibels_up_to_twice_the_level() {
+        let db = |dial: f32| {
             Settings {
-                volume: VOLUME_MAX,
+                volume: dial,
                 ..Settings::default()
             }
-            .gain(),
-            2.0,
-            "100% doubles it"
-        );
-        assert_eq!(
-            Settings {
-                volume: VOLUME_MIN,
-                ..Settings::default()
-            }
-            .gain(),
-            0.0,
-            "0% is silence"
-        );
+            .gain_db()
+        };
+        for (dial, want) in [
+            (0.1, -13.9794),
+            (0.25, -6.0206),
+            (0.75, 3.5218),
+            (1.0, 6.0206),
+        ] {
+            assert!(
+                near_db(db(dial), want),
+                "{:.0}% must be {want} dB, and it is {}",
+                dial * 100.0,
+                db(dial)
+            );
+        }
     }
 
     #[test]
@@ -592,7 +628,11 @@ mod tests {
         }
         .clamped();
         assert_eq!(settings.volume, VOLUME_MAX, "a hand-edited 900% is 100%");
-        assert_eq!(settings.gain(), VOLUME_GAIN_AT_FULL);
+        assert!(
+            near_db(settings.gain_db(), 6.0206),
+            "the ceiling of the dial is the ceiling of the dial, not of a gain: {}",
+            settings.gain_db()
+        );
         assert_eq!(
             Settings {
                 volume: -1.0,
@@ -614,10 +654,10 @@ mod tests {
             loaded.volume, 0.55,
             "the number changes, the loudness does not"
         );
-        assert_eq!(
-            loaded.gain(),
-            1.1,
-            "the gain applied to the PCM is the one v1 asked for"
+        assert!(
+            near_db(loaded.gain_db(), 0.8279),
+            "the level v1 asked for is the level today's chain applies: {}",
+            loaded.gain_db()
         );
 
         std::fs::write(&path, r#"{"volume":2.0}"#).unwrap();
@@ -640,7 +680,11 @@ mod tests {
         let path = scratch("v2-volume");
         std::fs::write(&path, r#"{"volume":0.75,"settings_version":2}"#).unwrap();
         assert_eq!(load(&path).volume, 0.75, "75% stays 75%");
-        assert_eq!(load(&path).gain(), 1.5);
+        assert!(
+            near_db(load(&path).gain_db(), 3.5218),
+            "75% is 1.5 times the level: {}",
+            load(&path).gain_db()
+        );
 
         // The version written by `save` is what makes that possible.
         let settings = Settings {

@@ -17,12 +17,15 @@ What your cache holds is what you get — `zot-speaks` reads the cache and never
 | `model.safetensors` | 102 823 920 B | fp32 — what `Quant::F32` loads, and what this extension loads |
 | `model.q8.gguf` | 64 512 352 B | GGUF, `q8_0` (8-bit blocks) |
 | `model.q4k.gguf` | 55 075 168 B | GGUF, `q4_k` (4-bit, k-quant) |
-| `model.gguf`, `model.t8.gguf` | absent | older filenames ptts does not look for in 0.4.0 |
+| `model.gguf`, `model.t8.gguf` | absent | older filenames `ptts` does not look for |
 
-`ptts 0.4.0` picks between them by the quantization it is asked for (`checkpoint::weight_candidates`):
+`ptts` picks between them by the quantization it is asked for (`checkpoint::weight_candidates`, byte-identical
+in 0.4.0 and 0.7.1):
 `Q4k` → `model.q4k.gguf` else safetensors; `Q80` → `model.q8.gguf` else safetensors; anything else,
-including `F32`, → safetensors else `model.q8.gguf`. Quantization here is CPU-only: `ptts` exposes
-`q8_0` and `q4k` for the CPU path and nothing for a GPU.
+including `F32`, → safetensors else `model.q8.gguf`. Quantization here is CPU-only: `ptts` exposes `q8_0` and
+`q4k` for the CPU path and nothing for a GPU, and this extension is CPU-only by decision (ADR-0025) — the
+opt-in Mimi quantization 0.7.x adds (`TTSModel::quantize_mimi`) is a CPU feature too, and this artifact does
+not use it.
 
 ## The measurement
 
@@ -30,7 +33,9 @@ including `F32`, → safetensors else `model.q8.gguf`. Quantization here is CPU-
 else loaded. The utterance is 7.68 s of speech — *"The quick brown fox jumps over the lazy dog.
 Quantizing the weights does not change the words, only how fast and how much memory they take."* —
 voice `Miles`, seed `42`, temperature `0.3`, model passed as a local snapshot directory (so no Hub API
-call). Mean of 3 repetitions with `ptts 0.4.0`. Every number below is one the CLI reports about
+call). Mean of 3 repetitions with `ptts 0.4.0` — the artifact now builds against 0.7.1, whose weight
+candidate chain is the same, and these bench figures have not been re-run on it. Every number below is one
+the CLI reports about
 itself: `first chunk` from its `generated … (RTF=…, first chunk …ms)` line, `rtf` from the same line,
 `peak RSS` from its `INFO peak RSS: … MB` line, load from its `loading model` / `model loaded`
 timestamps, and `wall` from the whole process. These are box-specific numbers: compare columns inside

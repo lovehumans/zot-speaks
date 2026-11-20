@@ -6,13 +6,16 @@ extension does and how to run it, see [../README.md](../README.md).
 ## How it works
 
 * Zot Extension Protocol: JSON-lines over stdin/stdout — `hello` → `hello_ack` →
-  `register_command` (`tts`, `tts-settings`) → `subscribe assistant_message, turn_end` → `ready`.
+  `register_command` (`tts`, `tts-settings`) → `subscribe assistant_message, turn_end,
+  user_prompt_submit` → `ready`.
   Panels use `open_panel` / `panel_render` / `panel_close` with `panel_key` events.
 * Inference: `gradium/phonon-31m-en`, `Quant::F32`, `DeviceKind::Cpu`, loaded once on a
   background thread; `stream_with` yields mono float PCM chunks so time-to-first-audio is
   independent of utterance length.
-* Audio: each chunk is scaled by `Settings::gain` (twice the volume dial), converted to mono s16le,
-  and written to the stdin of `ffplay`, the one external program this extension needs:
+* Audio: the volume dial is applied inside the synthesis chain — `Gain` in decibels, then a `Limiter`
+  holding the utterance under −1 dBFS — before the first chunk leaves the model. Each chunk is
+  converted to mono s16le and written to the stdin of `ffplay`, the one external program this
+  extension needs:
   `ffplay -nodisp -autoexit -loglevel error -f s16le -ar 24000 -ch_layout mono -`, plus
   `-af atempo=<speed>` whenever the Speed row is off `1.0x`. ffmpeg is a prerequisite, not a
   preference (ADR-0019): `paplay` was dropped along with `ZOT_SPEAKS_SINK`, because a second player
@@ -179,10 +182,27 @@ manifest and travels with the directory.
 
 * **Voice** — chosen from the local voice catalog (see *Which voices show up*); passed to the
   model as `SpeechOptions.voice(name)`.
-* **Volume** — a dial from `0%` to `100%` in 5% steps, default `50%`. The gain applied when
-  converting the model's float PCM to 16-bit samples is **twice** the dial, so `50%` is unity:
-  the voice at its own level, neither boosted nor attenuated. `100%` doubles it, which is the
-  headroom a quiet voice needs, and the clamp keeps `100%` from clipping anything louder.
+* **Volume** — a dial from `0%` to `100%` in 5% steps, default `50%`, and the dial means what it
+  always meant: `50%` is unity, the voice at its own level, `100%` is twice its level, `25%` half of
+  it, `0%` silence. What changed is where that scaling happens: it is now a **gain stage and a
+  limiter** inside the synthesis chain instead of a multiplier and a hard clamp in the writer. The
+  dial's factor is handed to `Gain` as decibels (`100%` is +6.02 dB, `25%` is −6.02 dB), and a
+  `Limiter` follows it with a 3 ms lookahead, a ceiling at −1 dBFS and a 100 ms release.
+
+  The difference is measurable on one fixed take (voice Alfie, `ZOT_SPEAKS_SEED=42`, one 4.2 s sentence, whose
+  raw peak is 0.796 FS). At `100%` the old scaling drove 349 samples onto full scale, 13 of them in a
+  row, and left them flat there; the limiter leaves **0** samples at the ceiling and no flat run, with
+  the peak at 0.891 FS (−1.00 dBFS) instead of pinned at 1.000 FS. Holding the peaks costs 1.7 dB of
+  average level on that take (rms −14.70 → −16.37 dBFS) and leaves the crest factor a little more of
+  itself (5.43× → 5.87×). On the rungs measured, `25%` and `50%`, the two paths agree sample for
+  sample (peak 0.796 FS, rms −20.60 dBFS): the limiter is idle there, because the peak is already
+  under its ceiling. It starts engaging on this take just above `55%`. The s16 writer still clamps,
+  as a last resort rather than as the part that shapes the level.
+
+  The limiter's release is deliberately far longer than its lookahead: the window that decides a
+  sample's gain starts one sample *after* the sample it governs, so an isolated peak is caught by the
+  attenuation still being held from the samples around it. A release shorter than the lookahead lets
+  such a peak through at full gain, which is measured in a unit test rather than asserted.
 * **Speed** — a ladder from `0.5x` to `2.0x` in `0.1` steps, default `1.0x`, stored as the plain
   number you would say (`1.2`). It is a **player** setting, not a model setting: Phonon always
   synthesizes at its own natural rate, and the player is asked for the tempo — `ffplay` through
@@ -272,6 +292,35 @@ The project is the `cwd` zot reports on `hello_ack` and on every event frame, ca
 same directory reached two ways is one entry — and a panel left open follows the session when that
 cwd moves, rather than going on editing the project it happened to open in.
 
+## A new message outranks the talk it follows
+
+The extension subscribes to `user_prompt_submit` next to `assistant_message` and `turn_end`, and on
+it sends the same `Cmd::Stop` that `/tts stop` asks for. The host fires the event the moment it
+accepts what was typed, before that input is appended or queued, which is the earliest moment
+anyone can know the user has moved on. An utterance that answers the message they just replaced has
+nothing left to say, and talking over them is the one thing a reader no longer needs.
+
+Four properties of it are worth knowing, because they are what the harnesses guard:
+
+* **Every kind of talk.** An auto-spoken answer, a `/tts`, a voice audition in the picker, the
+  Temperature row's repetition: all of them share the playback queue, and a Stop ends what is in it.
+  A request queued but not yet started is dropped rather than started, because `coalesce` ranks a
+  Stop above everything already in the queue — so an answer that had not gotten its mouth open yet
+  never opens it.
+* **Silent.** No note is written. Typing the message is the reason, and a footer for every message
+  would be noise; `/tts stop` reports because it was asked for by name.
+* **No setting, on purpose.** There is no row for it and none is planned (ADR-0026). A row that can hold only
+  one value documents a mode nobody asked for, and one process serves every project: a prompt typed here can cut
+  an utterance being read there, so an honest *never interrupt* would have to be scoped per project the way
+  auto-speak is, for a behaviour whose only cost is speech nobody asked to keep. Reopening it starts with a user
+  asking for that mode.
+* **Cooperative.** The `SpeechStream` is dropped at the next chunk boundary and the sink's stdin is
+  closed, which is where `Sink::finish` grants its bounded grace before killing a player that will
+  not take the hint. How long that takes to reach the pipe is chunk pacing plus the pacing sleep of
+  the chunk already written: measured 94–1716 ms across five runs in `dev/test.sh`, which asserts 2000 ms as
+  the ceiling. The audible tail is longer than that, because the player has already been handed
+  audio it intends to play.
+
 ## Local-only by design
 
 `zot-speaks` **reads** the Hugging Face cache; it **never downloads** models or voices at runtime.
@@ -297,7 +346,10 @@ Model and voice snapshots are looked up under the first of:
 
 `just bootstrap` fills the cache the extension then reads (`just fetch-model` and `just fetch-voices`
 are its two halves; `just cache` reports the result). Underneath they are the `ptts` CLI and
-`dev/prefetch-en-voices.sh`, and the same thing by hand is:
+`dev/prefetch-en-voices.sh`. `just fetch-ptts` is what puts that CLI where both fetch recipes look
+first — `./ptts` in the clone — at the version `Cargo.toml` names, checked against the upstream
+release's `SHA256SUMS`; which model commit a cache warm resolves is decided by that library, so a
+stale helper warms the cache with an older release's weights. The same thing by hand is:
 
 ```sh
 ptts --voice Miles "warm up"                   # fetches model + one voice together

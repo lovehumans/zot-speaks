@@ -1,11 +1,13 @@
 //! The audio sink: one player, `ffplay`, fed raw PCM through a pipe.
 //!
 //! Everything this extension knows about the player lives on this side of the seam: the argv that
-//! states the format, the gain scaling and s16le conversion that produce the bytes, the clock that
-//! keeps the feed at the player's pace, what the player's own words mean when it gives up, and how it
-//! is shut down — drained if the audio is still wanted, killed after a bounded grace if it is not.
-//! The caller owns the utterance: what to synthesize, when a Stop or a superseding request cuts it
-//! off, and which sentence reaches the user.
+//! states the format, the s16le conversion that produces the bytes, the clock that keeps the feed at
+//! the player's pace, what the player's own words mean when it gives up, and how it is shut down —
+//! drained if the audio is still wanted, killed after a bounded grace if it is not. The caller owns
+//! the utterance: what to synthesize, when a Stop or a superseding request cuts it off, and which
+//! sentence reaches the user. The *level* is not owned here: the volume dial is applied upstream, in
+//! the synthesis chain (`tts::post_chain`), so what arrives at `write` is already at the level the
+//! dial asked for.
 //!
 //! Three verbs, in order: [`Sink::open`], [`Sink::write`], [`Sink::finish`]. Nothing else is public,
 //! so the rules below are the only way to talk to a player, and each one is testable where it lives.
@@ -114,12 +116,14 @@ fn player_args(rate: u32, speed: Speed) -> Vec<String> {
     args
 }
 
-/// One mono sample, in the format the player is told to expect. The gain is `Settings::gain` — twice
-/// the volume dial — so a loud voice has to clamp rather than wrap: an i16 that overflows plays as a
-/// click. A non-finite sample is silence, not NaN cast to an arbitrary integer.
-fn sample_to_s16(sample: f32, gain: f32) -> i16 {
+/// One mono sample, in the format the player is told to expect. The level was decided upstream, by
+/// the synthesis chain, so this is a conversion and not a volume control — but it still clamps, as a
+/// last line rather than as the mechanism: an i16 that overflows plays as a click, and a sample that
+/// is not finite would become an arbitrary integer. A chunk that reaches the clamp at all means the
+/// chain above it failed to hold the ceiling, and that is worth more than a wrapped sample.
+fn sample_to_s16(sample: f32) -> i16 {
     let value = if sample.is_finite() {
-        (sample * gain).clamp(-1.0, 1.0)
+        sample.clamp(-1.0, 1.0)
     } else {
         0.0
     };
@@ -164,7 +168,6 @@ pub struct Sink {
     stdin: ChildStdin,
     /// Reused so a chunk costs no allocation; `write` clears it before filling it.
     buffer: Vec<u8>,
-    gain: f32,
     rate: u32,
     tempo: f64,
     started: Instant,
@@ -172,10 +175,10 @@ pub struct Sink {
 }
 
 impl Sink {
-    /// Start the player for one utterance: this is the rate the synthesis produced, the speed the
-    /// settings asked for, and the gain the volume dial means. Everything the byte stream depends on
-    /// is fixed here, which is what leaves [`Sink::write`] one argument wide.
-    pub fn open(rate: u32, speed: Speed, gain: f32) -> Result<Sink, SinkError> {
+    /// Start the player for one utterance: this is the rate the synthesis produced and the speed the
+    /// settings asked for. Everything the byte stream depends on is fixed here, which is what leaves
+    /// [`Sink::write`] one argument wide.
+    pub fn open(rate: u32, speed: Speed) -> Result<Sink, SinkError> {
         let mut child = match Command::new(PLAYER)
             .args(player_args(rate, speed))
             .stdin(Stdio::piped())
@@ -195,7 +198,6 @@ impl Sink {
             child,
             stdin,
             buffer: Vec::new(),
-            gain,
             rate,
             tempo: speed.factor(),
             started: Instant::now(),
@@ -211,7 +213,7 @@ impl Sink {
         self.buffer.reserve(samples.len() * 2);
         for &sample in samples {
             self.buffer
-                .extend_from_slice(&sample_to_s16(sample, self.gain).to_le_bytes());
+                .extend_from_slice(&sample_to_s16(sample).to_le_bytes());
         }
         self.stdin.write_all(&self.buffer)?;
         self.samples += samples.len() as u64;
@@ -382,25 +384,23 @@ mod tests {
         }
     }
 
-    /// The gain is twice the volume dial, so the multiplication has to clamp instead of wrap: an
-    /// i16 that overflows is a click, and a NaN cast is a full-scale value out of nowhere.
+    /// The conversion is not a volume control, so it scales nothing and must not wrap anything: an i16
+    /// that overflows is a click, a NaN cast is a full-scale value out of nowhere, and a sample beyond
+    /// full scale is clamped as a last line rather than flattened as a matter of course.
     #[test]
-    fn pcm_scaling_amplifies_without_wrapping() {
-        let quiet = sample_to_s16(0.25, 0.2);
-        assert_eq!(quiet, (0.25f64 * 0.2 * 32767.0).round() as i16);
+    fn pcm_conversion_neither_scales_nor_wraps() {
+        assert_eq!(sample_to_s16(0.25), (0.25f64 * 32767.0).round() as i16);
+        assert_eq!(sample_to_s16(1.0), 32767);
+        assert_eq!(sample_to_s16(-1.0), -32767);
+        assert_eq!(sample_to_s16(0.0), 0);
         assert_eq!(
-            sample_to_s16(1.0, 2.0),
+            sample_to_s16(1.5),
             32767,
             "a hot sample clamps at full scale"
         );
-        assert_eq!(sample_to_s16(-1.0, 2.0), -32767);
-        assert_eq!(sample_to_s16(0.0, 2.0), 0);
-        assert_eq!(
-            sample_to_s16(f32::NAN, 2.0),
-            0,
-            "a non-finite sample is silence"
-        );
-        assert_eq!(sample_to_s16(f32::INFINITY, 1.0), 0);
+        assert_eq!(sample_to_s16(-1.5), -32767);
+        assert_eq!(sample_to_s16(f32::NAN), 0, "a non-finite sample is silence");
+        assert_eq!(sample_to_s16(f32::INFINITY), 0);
     }
 
     /// The clock follows the speed asked of the player: audio handed to `atempo` drains that much

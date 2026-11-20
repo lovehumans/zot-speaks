@@ -45,7 +45,7 @@ use zot_speaks::voices::VoiceInfo;
 
 pub const PANEL_ID: &str = "zot-speaks-settings";
 
-/// Volume moves in 5% of the dial (see `settings::Settings::gain`: 50% is the voice's own level).
+/// Volume moves in 5% of the dial (see `settings::Settings::gain_db`: 50% is the voice's own level).
 const VOLUME_STEP: f32 = 0.05;
 const TEMPERATURE_STEP: f32 = 0.05;
 /// What the Temperature row says while it is the selected row, and why it has to be said out loud:

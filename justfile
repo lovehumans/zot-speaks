@@ -14,8 +14,37 @@ default:
 
 # ---- one-time bootstrap ---------------------------------------------------------------
 # zot-speaks never downloads: it only reads the Hugging Face cache. These recipes are the
-# network step, run once. They need the upstream `ptts` CLI — install it from
+# network step, run once. They need the upstream `ptts` CLI: `just fetch-ptts` fetches the
+# version this artifact is built against, or install it yourself from
 # https://github.com/gradium-ai/xn-ptts/releases, put it on PATH, or set PTTS=/path/to/ptts.
+
+# Which model commit a cache warm resolves is decided by the ptts library, so a helper older than the
+# one the artifact builds against warms the cache with an older one's weights, and ./ptts is gitignored
+# so nothing would ever flag it. Lands where the two fetch recipes look first.
+# fetch the upstream ptts CLI at the version Cargo.toml names, verified, as ./ptts
+fetch-ptts:
+    @set -eu; \
+    url=https://github.com/gradium-ai/xn-ptts/releases/download; \
+    ver=$(sed -n 's/^ptts = .*version = "\([0-9.]*\)".*/\1/p' Cargo.toml | head -1); \
+    [ -n "$ver" ] || { echo "fetch-ptts: no ptts version in Cargo.toml"; exit 1; }; \
+    case "$(uname -s) $(uname -m)" in \
+    "Linux x86_64") target=x86_64-unknown-linux-gnu ;; \
+    "Linux aarch64") target=aarch64-unknown-linux-gnu ;; \
+    "Darwin x86_64") target=x86_64-apple-darwin ;; \
+    "Darwin arm64") target=aarch64-apple-darwin ;; \
+    *) echo "fetch-ptts: no upstream archive named for $(uname -s) $(uname -m); install the ptts CLI yourself"; exit 1 ;; \
+    esac; \
+    asset=ptts-$ver-$target.tar.gz; \
+    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' INT TERM EXIT; \
+    curl -fsSL -o "$tmp/$asset" "$url/v$ver/$asset"; \
+    curl -fsSL -o "$tmp/SHA256SUMS" "$url/v$ver/SHA256SUMS"; \
+    grep "  $asset\$" "$tmp/SHA256SUMS" > "$tmp/check" || \
+        { echo "fetch-ptts: $asset is not listed in the release checksums"; exit 1; }; \
+    ( cd "$tmp" && if command -v sha256sum >/dev/null 2>&1; then sha256sum -c check; else shasum -a 256 -c check; fi ); \
+    tar -xzf "$tmp/$asset" -C "$tmp"; \
+    mv -f "$tmp/ptts-$ver-$target/ptts" ./ptts; \
+    chmod +x ./ptts; \
+    echo "fetch-ptts: ./ptts is now $ver for $target, the version Cargo.toml names"
 
 # Cache the model (~102 MB) and one voice together. VOICE picks the voice: just fetch-model VOICE=Aria
 fetch-model VOICE="Miles":
@@ -68,12 +97,15 @@ install-release TAG="latest":
     chmod +x "$tmp/zot-speaks"; \
     stage="$tmp/stage/zot-speaks"; mkdir -p "$stage"; \
     cp extension.json "$stage/extension.json"; \
+    if [ -d skills ]; then cp -R skills "$stage/skills"; else echo "no skills/ in this clone: the manifest would name a skill bundle that is not there"; fi; \
     mv "$tmp/zot-speaks" "$stage/zot-speaks"; \
     zot ext install "$stage"
 
 # update an installed copy from a Release: fetch the binary and the manifest that Release publishes,
 # verify both against its SHA256SUMS, then swap in place; settings.json untouched. Releases from
 # v1.7.15 carry extension.json; older ones carry only the binary, and then this says so.
+# A running zot picks the swap up with `/reload-ext`: it re-reads manifests, respawns subprocesses and
+# rebuilds the tool registry, cancelling the turn in progress first. No restart needed.
 # The target follows zot's own lookup: $ZOT_HOME, else $XDG_STATE_HOME/zot, else ~/.local/state/zot.
 # Override INSTALLED for a project-local install: INSTALLED=<project>/.zot/extensions/zot-speaks
 update-release TAG="latest":
@@ -92,7 +124,8 @@ update-release TAG="latest":
     mv -f "$installed/zot-speaks.new" "$installed/zot-speaks"; \
     if [ "$manifest" = yes ]; then \
       cp "$tmp/extension.json" "$installed/extension.json"; \
-      echo "updated $installed from {{TAG}} (binary + extension.json, settings.json untouched)"; \
+      rm -rf "$installed/skills"; cp -R skills "$installed/skills"; \
+      echo "updated $installed from {{TAG}} (binary + extension.json + skills/, settings.json untouched)"; \
     else \
       echo "updated $installed from {{TAG}} (binary only: this Release publishes no extension.json, so zot still reports the version the installed manifest claims)"; \
     fi
@@ -126,6 +159,7 @@ run CMD="/tts hello":
 install-ext: build
     @stage="$(mktemp -d)"; mkdir -p "$stage/zot-speaks"; \
     cp extension.json "$stage/zot-speaks/extension.json"; \
+    cp -R skills "$stage/zot-speaks/skills"; \
     cp {{BIN}} "$stage/zot-speaks/zot-speaks"; \
     zot ext install "$stage/zot-speaks"
 
@@ -133,6 +167,8 @@ install-ext: build
 # (`zot ext install` refuses to overwrite, and `zot ext remove` would delete the state file.)
 # The manifest travels with the binary on purpose: `zot ext list` reports the manifest's version, so
 # a stale one would advertise a version the binary does not have, and never carry a new command.
+# A running zot picks the swap up with `/reload-ext`: it re-reads manifests, respawns subprocesses and
+# rebuilds the tool registry, cancelling the turn in progress first. No restart needed.
 # The target follows zot's own lookup: $ZOT_HOME, else $XDG_STATE_HOME/zot, else ~/.local/state/zot.
 # Override INSTALLED for a project-local install: INSTALLED=<project>/.zot/extensions/zot-speaks
 update-ext: build
@@ -140,4 +176,5 @@ update-ext: build
     test -d "$installed" || { echo "not installed: $installed"; exit 1; }; \
     cp {{BIN}} "$installed/zot-speaks.new"; mv -f "$installed/zot-speaks.new" "$installed/zot-speaks"; \
     cp extension.json "$installed/extension.json"; \
+    rm -rf "$installed/skills"; cp -R skills "$installed/skills"; \
     echo "updated $installed from source $(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^\"]*\)".*/v\1/p' extension.json | head -1) (settings.json untouched)"
