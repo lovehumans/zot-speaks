@@ -62,7 +62,10 @@ fetch-voices VOICES="":
 # both, in the order that works: model first, then the whole English catalog
 bootstrap: fetch-model fetch-voices
 
-# show what the extension can see: model snapshot + voices ready (hub precedence as in cache.rs)
+# show what the extension can see: model snapshot + voices ready (hub precedence as in cache.rs).
+# The snapshot named is the one the artifact will load: `MODEL_REVISION` in src/tts.rs, read here so
+# there is one place that says which revision that is. A cache that lacks it gets the one it has, and
+# this says which of the two is being reported.
 cache:
     @hub="${HF_HUB_CACHE:-}"; \
     if [ -z "$hub" ]; then \
@@ -71,9 +74,17 @@ cache:
         else hub="$HOME/.cache/huggingface/hub"; fi; \
     fi; \
     model="$hub/models--gradium--phonon-31m-en"; voices="$hub/models--gradium--phonon-voices"; \
-    snap=$(ls -d "$model/snapshots"/*/ 2>/dev/null | head -1); \
+    want=$(sed -n 's/^const MODEL_REVISION: &str = "\([0-9a-f]*\)".*/\1/p' src/tts.rs | head -1); \
+    snaps=$(ls -d "$model/snapshots"/* 2>/dev/null); \
+    snap=$(printf '%s\n' "$snaps" | grep "/${want}$" | head -1); \
+    if [ -z "$snap" ]; then snap=$(printf '%s\n' "$snaps" | head -1); fi; \
     if [ -z "$snap" ]; then echo "model: not cached under $hub -> run 'just bootstrap'"; \
-    else echo "model: $snap ($(du -sh "$model" | cut -f1) cached)"; fi; \
+    elif [ -n "$want" ] && [ "${snap##*/}" != "$want" ]; then \
+        echo "model: $snap ($(du -sh "$model" | cut -f1) cached) — this build names $want, which is"; \
+        echo "       not cached; the extension loads this one and says so on stderr"; \
+    else \
+        echo "model: $snap ($(du -sh "$model" | cut -f1) cached)"; \
+    fi; \
     if [ -d "$voices" ]; then \
         echo "voices: $(find "$voices" -name '*.safetensors' | wc -l) embedding(s) cached, 37 in the English catalog"; \
     else echo "voices: no catalog cached -> run 'just bootstrap'"; fi

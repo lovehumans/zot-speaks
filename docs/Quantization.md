@@ -9,8 +9,15 @@ is also the recipe for measuring it on your own box.
 
 ## What is actually on disk
 
-`gradium/phonon-31m-en` (snapshot `8c64b55e…`) publishes several weight encodings of the same model.
-What your cache holds is what you get — `zot-speaks` reads the cache and never downloads:
+`gradium/phonon-31m-en` publishes several weight encodings of the same model. The revision this
+artifact loads — `src/tts.rs` names `92741c5b…`, which is what `ptts` 0.7.1 and `just fetch-model` fetch —
+and the older `8c64b55e…`, which is what `ptts` 0.4.0 fetched and what the tables below were measured on,
+carry the same weights and the same tokenizer: `model.safetensors` is 102 823 920 B with blob
+`sha256:8a04cf83…` in both, `tokenizer.json` is 277 967 B with blob `sha256:691a0006…` in both, and both
+announce the same `model_id` (`sig 5f0a2aab`, `epoch 200`). They differ in `config.json` (2 851 B, against
+4 634 B holding the same block plus a Hugging Face Transformers one) and in `default-voice.safetensors`
+(256 136 B in both, different blobs). So the sizes below hold whichever of the two your cache holds. What
+your cache holds is what you get — `zot-speaks` reads the cache and never downloads:
 
 | file | size | what it is |
 |---|---|---|
@@ -120,7 +127,8 @@ to repeat, on that box, before anything ships. `ptts` reports what you need in i
 comparison needs nothing beyond the CLI:
 
 ```sh
-snapshot="$HOME/.cache/huggingface/hub/models--gradium--phonon-31m-en/snapshots/8c64b55ec301728e2d1695bfea87a08a267d0c2d"
+# the revision src/tts.rs names; the weights blob is the one 8c64b55e… has too
+snapshot="$HOME/.cache/huggingface/hub/models--gradium--phonon-31m-en/snapshots/92741c5b07d085ff840e26fea8ce43110b87852f"
 text="The quick brown fox jumps over the lazy dog. Quantizing the weights does not change the words, only how fast and how much memory they take."
 
 # full precision, what zot-speaks asks for

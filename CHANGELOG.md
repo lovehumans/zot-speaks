@@ -6,6 +6,30 @@ published CI feeds that section to `gh release create --notes-file`. A Release's
 afterwards; a published tag cannot — which is why the notes live in a tracked file instead of in the
 tag message.
 
+## v1.10.1 — The artifact names the model snapshot it loads
+
+- **One revision, named in the binary.** A Hugging Face cache can hold two snapshots of
+  `gradium/phonon-31m-en`: a cache warm fetches the revision that the `ptts` release running it names as its
+  default, and until now the extension played whichever entry the directory listed first. It now loads the
+  revision `src/tts.rs` names, `92741c5b07d085ff840e26fea8ce43110b87852f` — the one `ptts` 0.7.1 and
+  `just fetch-model` fetch. The weights are not in question: both snapshots hold the same 102 823 920-byte
+  fp32 `model.safetensors` and the same 277 967-byte `tokenizer.json` (`sha256sum` read through the symlinks),
+  and they differ in `config.json` (2 851 bytes against 4 634) and in the voice bundled beside the weights
+  (see [docs/Quantization.md](docs/Quantization.md), *What is actually on disk*).
+- **A cache holding only the other snapshot still speaks, and says which one it loaded:**
+  `zot-speaks: loading revision 8c64b55e…, not the revision this build names (92741c5b…); its levels and
+  timings are unmeasured here`. The wording is asserted in a unit test, so this note cannot drift into a
+  sentence that no longer names the revision it loaded.
+- **`just cache` now reports the snapshot the extension will load.** The `v1.10.0` recipe listed the first
+  entry of the snapshot directory (`ls -d "$model/snapshots"/*/ | head -1`), so on a cache holding both it
+  could name the revision the build does not use. It names the pinned one, and says so plainly when that
+  revision is not cached.
+- **The level figures published for 1.10.0 hold for the revision now pinned.** `dev/level-probe.sh` ran against
+  each cached snapshot — `RUNGS="0.25 0.5 0.8 1.0" SEED=42`, one fixed 4.2 s take in Alfie — and gave the same
+  figures at every rung: 101 760 samples, peak 0.3980 / 0.7961 / 0.8912 / 0.8913 full scale, 0 samples at the
+  ceiling, no flat run there, rms −26.62 / −20.60 / −17.16 / −16.37 dBFS. First sound arrived 14–17 ms into the
+  run on the older snapshot and 17–20 ms on this one, which is machine noise at that scale.
+
 ## v1.10.0 — A `voice-mode` skill, and a volume dial that limits instead of clipping
 
 - **The extension ships a skill** (`skills/voice-mode/SKILL.md`): a phrasing guide for answers that will be read

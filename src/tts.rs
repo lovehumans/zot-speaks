@@ -17,6 +17,12 @@ use crate::voices::{self, VoiceInfo};
 
 const MODEL_REPO: &str = "gradium/phonon-31m-en";
 
+/// The model revision this artifact loads: `ptts` 0.7.1's own default, and the one `just fetch-model`
+/// downloads. The figures published before 1.10.1 were measured against the revision ptts 0.4.0 pinned
+/// (`8c64b55e…`), so the level and timing tables carry the revision they were taken from — see
+/// `docs/Quantization.md`.
+const MODEL_REVISION: &str = "92741c5b07d085ff840e26fea8ce43110b87852f";
+
 /// The spoken language this model (`phonon-31m-en`, built with `Lang::En`) supports. Catalog
 /// voices whose `language` differs are neither offered in the picker nor registered, so a
 /// pre-populated foreign voice can never be fed to the English model.
@@ -25,18 +31,51 @@ pub const MODEL_LANGUAGE: &str = "en";
 /// Locate the already-cached `gradium/phonon-31m-en` snapshot under the HF cache. Candidates
 /// follow the downloaders' precedence (see `cache::hf_hub`), so a model fetched by `ptts`,
 /// `huggingface-cli`, or `hf-hub` is found regardless of a custom `HF_*` location.
-fn local_snapshot(hub: &Path) -> Option<PathBuf> {
+///
+/// A cache can hold more than one snapshot of this model — an older bootstrap ran a `ptts` whose
+/// default revision was a different commit. The named revision is the answer; a cache that does not
+/// have it falls back to its other snapshot, sorted so the same cache gives the same answer twice, and
+/// `load_synth` says out loud that it did.
+struct Snapshot {
+    dir: PathBuf,
+    /// `false` when this is the cache's offering rather than the revision the artifact names.
+    pinned: bool,
+}
+
+fn local_snapshot(hub: &Path) -> Option<Snapshot> {
     let snapshots = cache::repo_dir(hub, MODEL_REPO).join("snapshots");
-    let Ok(dirs) = std::fs::read_dir(&snapshots) else {
+    let Ok(entries) = std::fs::read_dir(&snapshots) else {
         return None;
     };
-    for entry in dirs.flatten() {
-        let dir = entry.path();
-        if dir.join("config.json").is_file() && dir.join("model.safetensors").is_file() {
-            return Some(dir);
-        }
+    let mut candidates: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|dir| dir.join("config.json").is_file() && dir.join("model.safetensors").is_file())
+        .collect();
+    if let Some(dir) = candidates
+        .iter()
+        .find(|dir| dir.file_name().and_then(|name| name.to_str()) == Some(MODEL_REVISION))
+    {
+        return Some(Snapshot {
+            dir: dir.clone(),
+            pinned: true,
+        });
     }
-    None
+    candidates.sort();
+    candidates
+        .into_iter()
+        .next()
+        .map(|dir| Snapshot { dir, pinned: false })
+}
+
+/// What `load_synth` says out loud when the cache's offering is not the revision this build names.
+/// The wording is pinned by a test because the revision a user's cache will offer is not something
+/// they can see otherwise (`just cache` reports the one this build names).
+fn unmeasured_revision_note(loaded: &str) -> String {
+    format!(
+        "zot-speaks: loading revision {loaded}, not the revision this build names \
+         ({MODEL_REVISION}); its levels and timings are unmeasured here"
+    )
 }
 
 /// Load the model once and register every locally-cached catalog voice by name.
@@ -46,7 +85,7 @@ fn local_snapshot(hub: &Path) -> Option<PathBuf> {
 pub fn load_synth(catalog: &[VoiceInfo]) -> Result<Synth, String> {
     apply_ptts_env();
     let hub = cache::hf_hub();
-    let dir = local_snapshot(&hub).ok_or_else(|| {
+    let picked = local_snapshot(&hub).ok_or_else(|| {
         format!(
             "Phonon 31m-en snapshot not found under {}; bootstrap once: `just fetch-model` \
              (needs the ptts CLI), or by hand `ptts --voice Miles \"warm up\"` / \
@@ -54,10 +93,18 @@ pub fn load_synth(catalog: &[VoiceInfo]) -> Result<Synth, String> {
             cache::repo_dir(&hub, MODEL_REPO).display()
         )
     })?;
+    if !picked.pinned {
+        let loaded = picked
+            .dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("?");
+        eprintln!("{}", unmeasured_revision_note(loaded));
+    }
 
     // Quant::F32 selects `model.safetensors`, matching the cached blob.
     let checkpoint = Checkpoint::resolve(
-        &dir,
+        &picked.dir,
         ResolveOptions {
             quant: Quant::F32,
             weights: None,
@@ -299,6 +346,7 @@ fn physical_cores_from_cpuinfo(text: &str) -> Option<usize> {
 mod tests {
     use super::*;
     use ptts::comp::{AudioModule, Chain, Gain};
+    use std::sync::atomic::AtomicU32;
 
     /// How far above the ceiling a limited signal is allowed to land, in the tests below: a tenth of a
     /// decibel. The window that decides a sample's gain starts one sample *after* the sample it governs,
@@ -675,5 +723,92 @@ mod tests {
         for (text, want, why) in cases {
             assert_eq!(physical_cores_from_cpuinfo(text), *want, "{why}");
         }
+    }
+
+    /// A throwaway hub holding one snapshot directory per revision named, each carrying the two files
+    /// a candidate has to have. Written under the temp dir; never touches the real HF cache.
+    fn temp_model_hub(tag: &str, revisions: &[&str]) -> PathBuf {
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let id = SEQ.fetch_add(1, Ordering::Relaxed);
+        let hub =
+            std::env::temp_dir().join(format!("zot-speaks-hub-{tag}-{}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&hub);
+        for revision in revisions {
+            let dir = cache::repo_dir(&hub, MODEL_REPO)
+                .join("snapshots")
+                .join(revision);
+            std::fs::create_dir_all(&dir).unwrap();
+            for file in ["config.json", "model.safetensors"] {
+                std::fs::write(dir.join(file), "").unwrap();
+            }
+        }
+        hub
+    }
+
+    /// The other English snapshot a user's cache can hold: what an older bootstrap fetched, the commit
+    /// ptts 0.4.0 named as its default and the one the pre-1.10.1 figures were measured against.
+    const EARLIER_REVISION: &str = "8c64b55ec301728e2d1695bfea87a08a267d0c2d";
+
+    /// A snapshot that would win a sorted fallback, so the test below cannot pass by sorting alone.
+    const FIRST_IN_ORDER_REVISION: &str = "0000000000000000000000000000000000000000";
+
+    /// Several snapshots of one model in one cache, and `read_dir` hands them out in filesystem order.
+    /// The revision this artifact names is the one that loads, whichever way the listing came out and
+    /// whichever way they sort.
+    #[test]
+    fn a_cache_holding_several_snapshots_loads_the_pinned_revision() {
+        let hub = temp_model_hub(
+            "pinned-created-last",
+            &[FIRST_IN_ORDER_REVISION, EARLIER_REVISION, MODEL_REVISION],
+        );
+        let picked = local_snapshot(&hub).expect("the scratch hub holds three snapshots");
+        assert_eq!(
+            picked.dir.file_name().and_then(|name| name.to_str()),
+            Some(MODEL_REVISION),
+            "the snapshot a listing happens to yield first is not the one to load"
+        );
+        assert!(
+            picked.pinned,
+            "a hit on the named revision is not a fallback"
+        );
+    }
+
+    /// A cache that does not hold the named revision still has to speak, so it uses what it has. That
+    /// fallback is the same snapshot on every run of the same cache, not whatever the listing yields.
+    #[test]
+    fn a_cache_without_the_pinned_revision_falls_back_to_the_same_one_every_time() {
+        let late_first = temp_model_hub("fallback-late-first", &["eee1111", "aaa2222"]);
+        let early_first = temp_model_hub("fallback-early-first", &["aaa2222", "eee1111"]);
+        let want = "aaa2222";
+        for hub in [&late_first, &early_first] {
+            let picked = local_snapshot(hub).expect("the scratch hub holds two snapshots");
+            assert_eq!(
+                picked.dir.file_name().and_then(|name| name.to_str()),
+                Some(want),
+                "the fallback has to be the same answer whichever order the cache was written in"
+            );
+            assert!(
+                !picked.pinned,
+                "this cache has no named revision, so it is a fallback"
+            );
+        }
+    }
+
+    /// The fallback is only half of it: `load_synth` has to say which revision it settled for. The
+    /// wording is pinned here because a user cannot see the revision their cache offers any other way
+    /// (`just cache` reports the one this build names).
+    #[test]
+    fn a_fallback_says_which_revision_it_loaded() {
+        let hub = temp_model_hub("fallback-note", &[EARLIER_REVISION]);
+        let picked = local_snapshot(&hub).expect("the scratch hub holds one older snapshot");
+        assert!(!picked.pinned);
+        let loaded = picked.dir.file_name().unwrap();
+        assert_eq!(
+            super::unmeasured_revision_note(loaded.to_str().unwrap()),
+            format!(
+                "zot-speaks: loading revision {EARLIER_REVISION}, not the revision this build names \
+                 ({MODEL_REVISION}); its levels and timings are unmeasured here"
+            )
+        );
     }
 }

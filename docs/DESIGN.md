@@ -342,6 +342,21 @@ Model and voice snapshots are looked up under the first of:
 3. `$XDG_CACHE_HOME/huggingface/hub`
 4. `$HOME/.cache/huggingface/hub`
 
+### Which model snapshot, when the cache holds several
+
+One model can have two snapshots in one cache: a cache warm fetches the revision the `ptts` release
+running it names as its default, and another release names another. The extension does not leave the
+choice to a directory listing. It loads the revision named in `src/tts.rs` as `MODEL_REVISION`, today
+`92741c5b…`, which is what `ptts` 0.7.1 and `just fetch-model` fetch. A cache holding some other
+snapshot and not that one still speaks — it uses what it has, the same one on every run, and says once
+on stderr what it loaded:
+
+```text
+zot-speaks: loading revision 8c64b55ec301728e2d1695bfea87a08a267d0c2d, not the revision this build names (92741c5b07d085ff840e26fea8ce43110b87852f); its levels and timings are unmeasured here
+```
+
+`just cache` reports the snapshot the extension will load, and names it as a fallback when it is one.
+
 ### One-time bootstrap
 
 `just bootstrap` fills the cache the extension then reads (`just fetch-model` and `just fetch-voices`

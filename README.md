@@ -251,7 +251,7 @@ releases](https://github.com/gradium-ai/xn-ptts/releases) have every other one.
 
 ```sh
 just bootstrap   # the model (~99 MiB) plus all 37 English voices (~9 MiB), once
-just cache       # what the extension can see right now: snapshot, and how many voices are ready
+just cache       # what the extension can see: the model snapshot it will load, and the voices ready
 ```
 
 Or in individual steps. `just fetch-model` fetches the model and one voice in a single run (`just fetch-model
@@ -264,6 +264,10 @@ You can listen to individual voices [here](https://huggingface.co/gradium/phonon
 
 If you skip this step, `/tts` warns you: it reports the missing snapshot, the
 path it looked under, and `just fetch-model` as the fix — and it never reaches for the network.
+
+The extension loads a fixed revision of the model, so a cache holding only some other revision — one an
+older `ptts` fetch brought — still speaks, and tells you on stderr which revision it loaded. `just cache`
+names the snapshot the extension will load, and flags it when it is not the one this build names.
 
 Do this before starting zot, or restart zot afterwards: a running extension has already read its
 catalog, so voices you fetch mid-session join the picker on the next zot start.
