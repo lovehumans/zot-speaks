@@ -6,6 +6,12 @@ published CI feeds that section to `gh release create --notes-file`. A Release's
 afterwards; a published tag cannot — which is why the notes live in a tracked file instead of in the
 tag message.
 
+## v1.11.0 — Hybrid Voice Mode
+
+- **Hybrid Voice Mode** The extension has a new hybrid mode, where the agent's chat output should be easy to listen to, while also remain easy to read at the same time!
+- **What a voice cannot read is no longer spoken.** Before text reaches the TTS engine, things like code blocks or certain parts of markdown are stripped away, so the TTS engine can phonemize it properly. Details are in the readme and voice-mode skill prompt.
+- **The `voice-mode` skill.** The voice-mode skill explains to the agent how to phrase it's output properly. It should not degrade reading ability. Details are in the voice-mode skill prompt.
+
 ## v1.10.1 — The artifact names the model snapshot it loads
 
 - **One revision, named in the binary.** A Hugging Face cache can hold two snapshots of
@@ -76,15 +82,6 @@ tag message.
   Hugging Face cache without ever fetching at runtime.
 - Commands, panel, keys, the voice picker and the PCM stream are the ones 1.9.1 shipped, apart from the level chain
   above, and apart from a new message now ending one.
-
-## v1.9.3 — A force push, and what an older clone has to do
-
-- **`main` and the tags `v1.8.0` … `v1.9.2` were rewritten, and a force push was necessary.** A clone made before
-  2026-11-11 still has those refs naming commits from before the rewrite, so a plain `git pull` does not settle them.
-- **An older clone fixes itself with** `git fetch origin --tags --force && git reset --hard origin/main`, or by
-  cloning again. Every Release keeps its text and its assets; what changed is the commit each tag names.
-- **Nothing was published under this number and no behaviour changed.** It documents git refs, not the artifact: the
-  sources, settings format, model, player and protocol each version carries are the ones it shipped with.
 
 ## v1.9.2 — The README opens with a logo
 

@@ -35,6 +35,12 @@
 //!     Stop is cooperative: we drop the `SpeechStream` and close the sink's stdin.
 //!   * Pacing to real time lives in the sink, so the player never buffers far ahead — low TTFB,
 //!     short tail.
+//!   * What reaches the model is filtered first (`tts::spoken_text`): fenced code, markdown table
+//!     rows and every inline code span are dropped, the last wherever they sit — alone or inside a pair
+//!     of parentheses — so nothing that only appears in code is ever pronounced (ADR-0039), and a heading
+//!     keeps its words with a full stop added after them. Every
+//!     utterance goes through `play_one` — an auto-spoken answer, a `/tts`, a panel audition — so the
+//!     filter lives there and nowhere else.
 
 mod panel;
 mod wire;
@@ -649,6 +655,14 @@ fn play_one(
     text: &str,
     settings: &Settings,
 ) -> Resume {
+    // What a voice cannot read is not spoken (see `tts::spoken_text`). Asked for before the options are
+    // built, so an utterance that will not happen costs no noise seed and no voice warning.
+    let spoken = tts::spoken_text(text);
+    if spoken.is_empty() {
+        // Nothing in it a voice could say: an answer that is only a code block or only a table goes
+        // quiet rather than feeding the model an empty request.
+        return Resume::Idle;
+    }
     let (options, used_voice) = tts::build_options(synth, settings, seeds.next());
     if !settings.voice.is_empty() && used_voice.is_none() {
         out.notify(
@@ -659,7 +673,7 @@ fn play_one(
             ),
         );
     }
-    let mut stream = match synth.stream_with(text, &options) {
+    let mut stream = match synth.stream_with(&spoken, &options) {
         Ok(stream) => stream,
         Err(e) => {
             out.notify("error", &format!("zot-speaks: synthesis failed: {e}"));

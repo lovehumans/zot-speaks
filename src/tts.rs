@@ -342,6 +342,132 @@ fn physical_cores_from_cpuinfo(text: &str) -> Option<usize> {
     (!seen.is_empty()).then_some(seen.len())
 }
 
+/// The text a voice is asked to read: `text` with what a voice cannot read taken out, so that the
+/// agent may write code and tables and still close a turn in phrasing one model can speak.
+///
+/// `ptts` normalizes the rest for us (measured in `examples/spoken_text_probe.rs`): braces, square
+/// brackets, `*`, bullets, arrows and emoji become whitespace, `(` and `;` become a comma, so words an
+/// agent writes in parentheses are already pronounced. What it does not handle is what an agent writes
+/// on purpose: a
+/// backtick becomes an apostrophe, a fenced block reaches the tokenizer as `'''rust let x equals foo,
+/// bar, '''`, and a table arrives with its pipes. So:
+///
+///   * a fenced block is dropped whole, language tag included,
+///   * a line starting with `|` is dropped, which takes a markdown table with it,
+///   * a heading marker at the start of a line is dropped, the heading's words are spoken, and a full
+///     stop is added after them so the voice takes a breath there (see [`spoken_heading`], ADR-0031),
+///   * an inline code span is dropped wherever it sits, parenthesized or not: what an agent wants the
+///     voice to say has to be in words, and a name in backticks is for the eye alone (ADR-0039,
+///     superseding the gloss and flag-hyphen rules ADR-0031 recorded here),
+///   * a parenthesis pair left holding no words is dropped with the span inside it, so "the formatter
+///     (`cargo fmt`)" is read as "the formatter" and not as a pause with nothing in it (see
+///     [`drop_wordless_parens`]).
+///
+/// Kept parts are joined with single spaces, and a run of whitespace inside one collapses to a single
+/// space. `ptts` collapses every run of whitespace anyway; that is only what makes the result readable
+/// in a test.
+///
+/// Limits, pinned by tests: only a ``` fence is a block, only a leading `|` is a table row, only a
+/// leading run of one to six `#` followed by a space or nothing is a heading marker, a heading that
+/// already ends in `.`, `!`, `?`, `:` or `;` gets no second stop, only a paired span is dropped so a
+/// line with an odd number of backticks keeps its tail, and the span rule reaches inside a span only,
+/// so a `~~~` fence, a `cmd | grep x` line, a prose `--` and a `#` that is not a heading marker
+/// (`#42`) are read as written.
+pub fn spoken_text(text: &str) -> String {
+    let mut kept: Vec<String> = Vec::new();
+    for (block, chunk) in text.split("```").enumerate() {
+        if block % 2 == 1 {
+            continue; // fenced code: the model cannot read it and neither can a listener
+        }
+        for line in chunk.lines() {
+            if line.trim_start().starts_with('|') {
+                continue;
+            }
+            let line = match spoken_heading(line) {
+                Some(heading) => heading,
+                None => line.to_string(),
+            };
+            let pieces: Vec<&str> = line.split('`').collect();
+            // Odd pieces are inside a span. The last piece of a line holding an odd number of
+            // backticks has no opening partner, and a stray backtick must not silence the sentence.
+            let unpaired = pieces.len().is_multiple_of(2);
+            for (piece, content) in pieces.iter().enumerate() {
+                let inside_span = piece % 2 == 1;
+                let stray = unpaired && piece + 1 == pieces.len();
+                if inside_span && !stray {
+                    continue;
+                }
+                kept.push(content.to_string());
+            }
+        }
+    }
+    let spoken = kept
+        .iter()
+        .flat_map(|part| part.split_whitespace())
+        .collect::<Vec<&str>>()
+        .join(" ");
+    let spoken = drop_wordless_parens(&spoken);
+    spoken.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+/// A parenthesis pair holding no words is a pause with nothing in it, which is what a dropped span
+/// leaves behind: "the formatter (`cargo fmt`)" keeps "the formatter", not "the formatter ( )". Inner
+/// commas and a nested pair count as nothing, and one pass is enough because an inner pair is emptied
+/// before the outer one is judged. An unmatched bracket stays as the agent wrote it.
+fn drop_wordless_parens(text: &str) -> String {
+    let mut kept: Vec<char> = Vec::with_capacity(text.len());
+    let mut open: Vec<usize> = Vec::new();
+    for ch in text.chars() {
+        match ch {
+            '(' => {
+                open.push(kept.len());
+                kept.push(ch);
+            }
+            ')' => {
+                let wordless = open.last().is_some_and(|&start| {
+                    let inner = &kept[start + 1..];
+                    !inner.iter().copied().any(char::is_alphanumeric)
+                });
+                if wordless {
+                    kept.truncate(open.pop().expect("an open pair was pushed above"));
+                } else {
+                    kept.push(ch);
+                }
+            }
+            _ => kept.push(ch),
+        }
+    }
+    kept.into_iter().collect()
+}
+
+/// A heading line as a voice reads it: marker off, full stop on, so the heading gets a breath after
+/// it. `None` for a line that is not a heading.
+///
+/// `ptts` leaves a `#` exactly as written (measured in `examples/spoken_text_probe.rs`: a line holding
+/// `# heading` reaches the phonemizer as `# heading`), so a heading an agent writes for the eye would
+/// be heard as its marker, and a heading with no stop after it runs straight into the sentence below
+/// it. Two rulings of the owner on 2026-11-24: a heading marker is never spoken, and a heading is
+/// handed over with a full stop on it. CommonMark's own shape is where this stops, so a `#` that is not
+/// a marker stays: a run of one to six `#` counts only when a space or the line end follows it, which
+/// leaves `#42` and `#######` as written. A heading that already ends in terminal punctuation gets no
+/// second stop, and an empty one gets nothing at all.
+fn spoken_heading(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let marker = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+    if marker == 0 || marker > 6 {
+        return None;
+    }
+    let rest = &trimmed[marker..];
+    if !(rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t')) {
+        return None; // `#42` and `#######` are not markers
+    }
+    let text = rest.trim_start();
+    if text.is_empty() || matches!(text.chars().last(), Some('.' | '!' | '?' | ':' | ';')) {
+        return Some(text.to_string());
+    }
+    Some(format!("{text}."))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,5 +936,93 @@ mod tests {
                  ({MODEL_REVISION}); its levels and timings are unmeasured here"
             )
         );
+    }
+
+    /// What a voice is handed: fenced code, table rows and every inline code span are gone, a heading
+    /// is spoken without its `#` marker and with a full stop after it, and a parenthesis pair that held
+    /// only a dropped span goes with it (ADR-0031 as amended by ADR-0039).
+    #[test]
+    fn what_a_voice_gets_out_of_markdown() {
+        let cases: &[(&str, &str)] = &[
+            // The house shape: the words carry the sentence, the name is for the eye alone. A stop the
+            // agent wrote after a dropped span stands as its own token here, and `ptts` closes the space
+            // before it: the probe reads both cases as "… the provided command." and "… version one ten
+            // one." (see `examples/spoken_text_probe.rs`).
+            (
+                "Run the formatter over all targets with the provided command `cargo fmt --all -- --check`.",
+                "Run the formatter over all targets with the provided command .",
+            ),
+            (
+                "The GitHub command line tool (`gh`) bullet carries the reading.",
+                "The GitHub command line tool bullet carries the reading.",
+            ),
+            ("see (`gh`)", "see"),
+            // Two names in one pair leave the commas, and a pair holding only commas is dropped too.
+            (
+                "the harness (`dev/test.sh`, `dev/test-sink.sh`) runs the units",
+                "the harness runs the units",
+            ),
+            ("The tag is version one ten one (`v1.10.1`).", "The tag is version one ten one ."),
+            // Nothing inside backticks is spoken: a command, a flag, a target triple, a version.
+            ("Run `cargo fmt --all` now.", "Run now."),
+            ("Filter `git -C public log` now.", "Filter now."),
+            ("`x86_64-unknown-linux-gnu` is the target.", "is the target."),
+            // A span holds its own text: the `#` inside it is no heading marker, and it is silent.
+            ("see `## v1.11.0` now", "see now"),
+            ("Only a span: `git status`", "Only a span:"),
+            ("`git status`", ""),
+            // A stray backtick has no partner, so it must not silence the rest of the line.
+            (
+                "text with a stray ` backtick keeps its tail",
+                "text with a stray backtick keeps its tail",
+            ),
+            // Prose is untouched: the rule reaches inside a span only.
+            ("the fix -- which is small", "the fix -- which is small"),
+            // Parentheses holding words are kept, wherever a span used to sit next to them.
+            (
+                "Run `cargo fmt` (the formatter) now.",
+                "Run (the formatter) now.",
+            ),
+            (
+                "the `filter`(drop code (not the words around it) when dropped) works",
+                "the (drop code (not the words around it) when dropped) works",
+            ),
+            (
+                "Done.\n```rust\nlet x = foo(bar);\n```\nAll green.",
+                "Done. All green.",
+            ),
+            (
+                "| card | state |\n|---|---|\n| v1.10.1 | done |\nThree cards are in ready.",
+                "Three cards are in ready.",
+            ),
+            ("```sh\ngit status\n```", ""),
+            // The limit, pinned so a change here is noticed: only ``` fences are a block.
+            ("note\n~~~\ncode\n~~~\nend", "note ~~~ code ~~~ end"),
+            // A heading is its words, marker and indentation gone, plus the full stop the extension
+            // adds so the voice takes a breath after it (ADR-0031).
+            ("## The gates", "The gates."),
+            (
+                "###   One commit carries the change",
+                "One commit carries the change.",
+            ),
+            ("   # indented heading\ntext", "indented heading. text"),
+            ("##", ""),
+            // A heading that already ends in terminal punctuation is not given a second stop.
+            ("## Done.", "Done."),
+            ("## Is it fast?", "Is it fast?"),
+            ("## Listen:", "Listen:"),
+            // A trailing marker on a heading line is still spoken: `## F#` has to keep its `#`.
+            ("## Gates ##", "Gates ##."),
+            // A `#` that is not a marker stays as written, and so does a run past six.
+            ("#42 is open", "#42 is open"),
+            ("####### seven hashes", "####### seven hashes"),
+            // A heading whose words end in a span keeps its stop as a token of its own.
+            ("## Run `cargo fmt`", "Run ."),
+            // A heading marker inside a fenced block is gone with the block.
+            ("```md\n## Gates\n```\nAfter.", "After."),
+        ];
+        for (written, spoken) in cases {
+            assert_eq!(spoken_text(written), *spoken, "for {written:?}");
+        }
     }
 }

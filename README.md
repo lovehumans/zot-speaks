@@ -16,13 +16,13 @@ machine. No network access, no account, no cloud voice.
 
 | ✅ We do | ❌ We deliberately don't |
 |---|---|
-| ✅ Fully offline | ❌ Cloud / online TTS of any kind, network access |
-| ✅ CPU-only inference → the GPU stays free for your local LLM | ❌ Telemetry, accounts, anything that phones home |
-| ✅ A small English model, `gradium/phonon-31m-en`, with 37 voices | ❌ Voice cloning |
-| ✅ Audio streams as it is generated, and stops cleanly |  |
+| ✅ Fully offline | ❌ No Cloud / online TTS of any kind, network access |
+| ✅ CPU-only inference → the GPU stays free for your local LLM | ❌ No Telemetry, accounts, anything that phones home |
+| ✅ A small English model, `gradium/phonon-31m-en`, with 37 voices | ❌ No Voice cloning |
+| ✅ Audio streams as it is generated, and stops cleanly | ❌ No multiple TTS engines  |
 | ✅ Pitch-invariant speed control | |
 | ✅ Auto-speak of the final answer, scoped per project | |
-| ✅ A `voice-mode` skill that teaches the agent to phrase answers for speech | ❌ Applying that skill on its own initiative: it runs only when you invoke or pin it |
+| ✅ A `voice-mode` skill that teaches the agent to phrase answers for speech | |
 
 Phonon is a 31 M-parameter model: natural speech with imperfect prosody, not a commercial studio
 voice. Output is mono 24 kHz, streamed into `ffplay`'s stdin while it is being generated.
@@ -72,23 +72,18 @@ Sending a new message cuts off whatever is still being read out — an auto-spok
 voice audition. Quietly: typing the message is already the reason, so nothing is reported about it,
 unlike `/tts stop`, which you asked for by name.
 
-**Voice mode** is a skill the extension ships (`skills/voice-mode/SKILL.md`): it tells the agent to
-close a turn in phrasing a phonemizer handles — short sentences with full stops in them, prose
-instead of markdown, no quoted code, no commit hashes, capitals only where they change how a word
-is said (`TTS`, but `readme`),
-counts instead of lists of names, one question at a time. It is **user-invoked**: the agent
-never picks it up by itself, and auto-speak does not imply it. Run
-`/skill:zot-speaks:voice-mode`, or open `/skills` and press `p` to **pin the skill to the
-project** — from then on every fresh conversation in that project starts with it, which is the
-setting worth choosing if you always speak. A pin applies to fresh conversations, not to the one
-already running.
+**Voice mode** is a skill the extension ships (`skills/voice-mode/SKILL.md`): it tells the agent how to phrase it's output so it can be phonemized well, while still being readable.  
+It is **user-invoked or model-invoked**: run `/skill:zot-speaks:voice-mode`, or open `/skills`
+and press `p` to **pin the skill to the project**.
 
-**Speed** is a tempo setting, which stretches the time without shifting
-the pitch: it is handed to `ffplay` as ffmpeg's `atempo` filter, never re-timed in the extension.
+**What is not spoken, skill or no skill.** Before the text reaches the model, the extension takes
+out what a TTS cannot phonemize properly: fenced code blocks are dropped whole, as well as every row of a markdown table, and every inline code span is dropped wherever it sits.
+
+**Speed** is a pitch invariant tempo setting that is handed to `ffplay` as ffmpeg's `atempo` filter.
 
 **Repeats are new takes.** Every utterance is synthesized from its own noise seed, so saying the same
 line twice is not a replay — which is what makes the Temperature row audible as you step it. Set
-`ZOT_SPEAKS_SEED=42` in the environment when you want a session's utterances reproducible in order.
+`ZOT_SPEAKS_SEED=42` in the environment when you want a session's utterances to sound robotically identical.
 
 **Threads.** Inference uses one worker per physical core. Set `ZOT_TTS_THREADS=<n>` to override that on a
 machine you know — `1` is the smallest and quietest setting measured, at two to three times the time to
@@ -141,7 +136,7 @@ The clone supplies `extension.json` — the manifest zot needs — and the licen
 the binary. Verify before installing: `sha256sum -c` fails loudly on a truncated or tampered
 download, and you can cross-check the printed hash against the release notes. To pin a version
 instead of taking the newest, replace `latest` with the tag in both URLs:
-`releases/download/v1.7.8/…`.
+`releases/download/v1.10.0/…`.
 
 Start zot, or run `/reload-ext` in a session that is already running: `zot ext doctor` should list
 `zot-speaks` with `/tts` and `/tts-settings` active.
