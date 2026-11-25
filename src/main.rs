@@ -291,7 +291,7 @@ fn main() {
                     // `turn_end` fires after every model step, so its stop reason is what
                     // separates the answer worth reading out from a step that asked for a tool and
                     // carried on working. The host's names are its own, not the provider's: zot
-                    // reports the final step as `end` (`extensions.md` still shows `end_turn`), so
+                    // reports the final step as `end` (the installed host docs still show `end_turn`), so
                     // the gate lists the reasons that mean "not finished" and treats the rest as an
                     // answer.
                     "turn_end" => {

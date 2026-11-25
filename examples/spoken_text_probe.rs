@@ -22,6 +22,9 @@ fn main() {
         "## The gates\n### One commit carries the change\nAll green.",
         "## Run the formatter (`cargo fmt`)\nA heading whose words end in a parenthesized name.",
         "## Is it fast?\n## Listen:\n## Stop!\nQuiet.",
+        // A blockquote marker: `ptts` hands it to the tokenizer as written, so the filter replaces it
+        // with the word Quote, once per run of quoted lines.
+        "> The owner wrote this, and I am quoting it.\nBack to my own words.",
         // The case behind the skill's number rule: a figure with grouping spaces reaches the model as
         // digit groups, the same digits without them as a number, and a colon clock unchanged.
         "Checked at 16:52:06: 7 458 792 bytes, or 7458792, about 7.4 MB.",

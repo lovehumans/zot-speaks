@@ -356,6 +356,9 @@ fn physical_cores_from_cpuinfo(text: &str) -> Option<usize> {
 ///   * a line starting with `|` is dropped, which takes a markdown table with it,
 ///   * a heading marker at the start of a line is dropped, the heading's words are spoken, and a full
 ///     stop is added after them so the voice takes a breath there (see [`spoken_heading`], ADR-0031),
+///   * a blockquote marker at the start of a line is replaced by the word Quote, spoken once for a run
+///     of quoted lines, which is what names the quote to a listener and gives it its breath (see
+///     [`blockquote_body`], ADR-0044),
 ///   * an inline code span is dropped wherever it sits, parenthesized or not: what an agent wants the
 ///     voice to say has to be in words, and a name in backticks is for the eye alone (ADR-0039,
 ///     superseding the gloss and flag-hyphen rules ADR-0031 recorded here),
@@ -370,22 +373,44 @@ fn physical_cores_from_cpuinfo(text: &str) -> Option<usize> {
 /// Limits, pinned by tests: only a ``` fence is a block, only a leading `|` is a table row, only a
 /// leading run of one to six `#` followed by a space or nothing is a heading marker, a heading that
 /// already ends in `.`, `!`, `?`, `:` or `;` gets no second stop, only a paired span is dropped so a
-/// line with an odd number of backticks keeps its tail, and the span rule reaches inside a span only,
-/// so a `~~~` fence, a `cmd | grep x` line, a prose `--` and a `#` that is not a heading marker
-/// (`#42`) are read as written.
+/// line with an odd number of backticks keeps its tail, only a leading run of one or more `>` is a
+/// blockquote marker, a quote block is one run of consecutive quoted lines and is announced once, and
+/// the span rule reaches inside a span only, so a `~~~` fence, a `cmd | grep x` line, a prose `--`, a
+/// prose `a > b`, a line starting with `-->` and a `#` that is not a heading
+/// marker (`#42`) are read as written.
 pub fn spoken_text(text: &str) -> String {
     let mut kept: Vec<String> = Vec::new();
     for (block, chunk) in text.split("```").enumerate() {
         if block % 2 == 1 {
             continue; // fenced code: the model cannot read it and neither can a listener
         }
+        // A quote block is a run of consecutive quoted lines. A line that is not quoted ends it, and so
+        // does a fence, because every chunk between fences starts with a fresh run. The word that
+        // announces a block is spoken once: on its first line that holds any words at all.
+        let mut quoting = false;
+        let mut announced = false;
         for line in chunk.lines() {
             if line.trim_start().starts_with('|') {
                 continue;
             }
+            let quoted = line.trim_start().starts_with('>');
+            if !quoted {
+                quoting = false;
+            } else if !quoting {
+                quoting = true;
+                announced = false;
+            }
+            let line = blockquote_body(line);
             let line = match spoken_heading(line) {
                 Some(heading) => heading,
                 None => line.to_string(),
+            };
+            // The word goes on after the heading rule, so a heading inside a quote still loses its `#`.
+            let line = if quoted && !announced && !line.trim().is_empty() {
+                announced = true;
+                format!("{QUOTE_INTRO} {line}")
+            } else {
+                line
             };
             let pieces: Vec<&str> = line.split('`').collect();
             // Odd pieces are inside a span. The last piece of a line holding an odd number of
@@ -438,6 +463,28 @@ fn drop_wordless_parens(text: &str) -> String {
         }
     }
     kept.into_iter().collect()
+}
+
+/// The words of a blockquote line, marker gone; any other line exactly as it was written.
+///
+/// `ptts` leaves a `>` exactly as written (measured in `examples/spoken_text_probe.rs`: a line holding
+/// `> quoted words` reaches the phonemizer as `> quoted words`), so a reply that quotes the owner or a
+/// document hands the marker to the model. CommonMark's shape is where this stops: the marker is a `>`
+/// at the start of a line, after any indentation, and a run of them is a nested quote, which leaves
+/// `a > b` in prose and a line starting with `-->` as written.
+///
+/// The marker is not simply removed. [`spoken_text`] puts the word Quote in its place, once for a run of
+/// quoted lines, so a listener hears that a quote has started and hears a breath where the marker used
+/// to sit (the owner's ruling of 2026-11-25, ADR-0044, amending ADR-0043, which removed the marker in
+/// silence and left the breath to him).
+const QUOTE_INTRO: &str = "Quote.";
+
+fn blockquote_body(line: &str) -> &str {
+    let body = line.trim_start();
+    if !body.starts_with('>') {
+        return line;
+    }
+    body.trim_start_matches('>').trim_start()
 }
 
 /// A heading line as a voice reads it: marker off, full stop on, so the heading gets a breath after
@@ -939,8 +986,9 @@ mod tests {
     }
 
     /// What a voice is handed: fenced code, table rows and every inline code span are gone, a heading
-    /// is spoken without its `#` marker and with a full stop after it, and a parenthesis pair that held
-    /// only a dropped span goes with it (ADR-0031 as amended by ADR-0039).
+    /// is spoken without its `#` marker and with a full stop after it, a quote block is announced with
+    /// the word Quote and without its `>` marker, and a parenthesis pair that held only a dropped span
+    /// goes with it (ADR-0031 as amended by ADR-0039 and ADR-0044).
     #[test]
     fn what_a_voice_gets_out_of_markdown() {
         let cases: &[(&str, &str)] = &[
@@ -1020,6 +1068,38 @@ mod tests {
             ("## Run `cargo fmt`", "Run ."),
             // A heading marker inside a fenced block is gone with the block.
             ("```md\n## Gates\n```\nAfter.", "After."),
+            // A quote block is the word Quote and its words: the marker is replaced, once per block
+            // (ADR-0044).
+            ("> The owner wrote this, and I am quoting it.", "Quote. The owner wrote this, and I am quoting it."),
+            (
+                "> First quoted line.\n> Second quoted line.\nBack to my own words.",
+                "Quote. First quoted line. Second quoted line. Back to my own words.",
+            ),
+            ("   > an indented quote", "Quote. an indented quote"),
+            (">> a nested quote", "Quote. a nested quote"),
+            (">", ""),
+            // A heading inside a quote loses both markers and keeps the heading's stop.
+            ("> ## Quoted gates", "Quote. Quoted gates."),
+            // The limit, pinned so a change here is noticed: only a leading `>` is a marker.
+            ("a > b compares two numbers", "a > b compares two numbers"),
+            ("--> not a marker", "--> not a marker"),
+            // A `>` that is a marker with no space after it, as CommonMark reads it.
+            (">no space after the marker", "Quote. no space after the marker"),
+            // Once means once: the rest of the run is spoken without the word.
+            ("> One.\n> Two.\n> Three.", "Quote. One. Two. Three."),
+            // Any line that is not quoted ends a block, a blank line included, so two blocks are
+            // announced twice.
+            ("> One block.\n\n> Another block.", "Quote. One block. Quote. Another block."),
+            ("> A quote.\nMy own line.\n> A second quote.", "Quote. A quote. My own line. Quote. A second quote."),
+            // A quoted line with no words of its own does not spend the word: the first quoted line
+            // holding any is the one announced.
+            (">\n> Text after an empty marker.", "Quote. Text after an empty marker."),
+            // A fence ends a block, and its own lines are never quoted.
+            ("> Quoted.\n```rust\nlet x = 1;\n```\n> After the fence.", "Quote. Quoted. Quote. After the fence."),
+            // A table row is invisible to a voice, so it cannot end a block either.
+            ("> Quoted.\n| a | b |\n> Still the same block.", "Quote. Quoted. Still the same block."),
+            // A quoted line whose only content is a span: the span is gone, the word is not.
+            ("> `git status`", "Quote."),
         ];
         for (written, spoken) in cases {
             assert_eq!(spoken_text(written), *spoken, "for {written:?}");

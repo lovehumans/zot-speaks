@@ -182,10 +182,26 @@ install-ext: build
 # rebuilds the tool registry, cancelling the turn in progress first. No restart needed.
 # The target follows zot's own lookup: $ZOT_HOME, else $XDG_STATE_HOME/zot, else ~/.local/state/zot.
 # Override INSTALLED for a project-local install: INSTALLED=<project>/.zot/extensions/zot-speaks
+# A recipe installs the tree its justfile lives in, so a clone holding another version installs that
+# version. Before anything is copied, the manifest of this tree is compared with the manifest of the
+# installed copy, and an older one is refused: both versions are printed, and so is the directory the
+# recipe ran from. Refusing is the point. An older manifest is the shape of installing from the wrong
+# tree, and a swap that reads as a success is how it goes unnoticed.
 update-ext: build
-    @installed="${INSTALLED:-${ZOT_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/zot}/extensions/zot-speaks}"; \
+    @set -eu; \
+    installed="${INSTALLED:-${ZOT_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/zot}/extensions/zot-speaks}"; \
     test -d "$installed" || { echo "not installed: $installed"; exit 1; }; \
+    incoming=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' extension.json | head -1); \
+    current=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$installed/extension.json" 2>/dev/null | head -1); \
+    older=$(awk -v a="$incoming" -v b="$current" 'BEGIN{ if (a !~ /^[0-9]+\.[0-9]+\.[0-9]+$/ || b !~ /^[0-9]+\.[0-9]+\.[0-9]+$/) { print "unknown" } else { split(a, x, "."); split(b, y, "."); for (i = 1; i <= 3; i++) { x[i] += 0; y[i] += 0 }; print (x[1] < y[1] || (x[1] == y[1] && (x[2] < y[2] || (x[2] == y[2] && x[3] < y[3])))) ? "yes" : "no" } }'); \
+    note=""; if [ "$older" = unknown ]; then note=" (no version a number can be read from on one side, so nothing was compared)"; fi; \
+    if [ "$older" = yes ]; then \
+      echo "update-ext: refusing to install v$incoming over the installed v$current"; \
+      echo "            this recipe builds and installs the tree its justfile lives in: $PWD"; \
+      echo "            the copy it would overwrite is $installed"; \
+      exit 1; \
+    fi; \
     cp {{BIN}} "$installed/zot-speaks.new"; mv -f "$installed/zot-speaks.new" "$installed/zot-speaks"; \
     cp extension.json "$installed/extension.json"; \
     rm -rf "$installed/skills"; cp -R skills "$installed/skills"; \
-    echo "updated $installed from source $(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^\"]*\)".*/v\1/p' extension.json | head -1) (settings.json untouched)"
+    echo "updated $installed from source $(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^\"]*\)".*/v\1/p' extension.json | head -1) built in $PWD (settings.json untouched)$note"

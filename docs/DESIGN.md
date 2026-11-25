@@ -14,25 +14,30 @@ extension does and how to run it, see [../README.md](../README.md).
   independent of utterance length.
 * Text: what a voice cannot read is taken out before `stream_with` sees it. `tts::spoken_text` drops a
   ` ``` ` block whole, drops a line starting with `|`, takes the one-to-six `#` marker off a heading line
-  and puts a full stop on it so the voice takes a breath after the heading, and drops every inline code
-  span wherever it sits, on its own or inside a pair of parentheses (ADR-0039, which supersedes the gloss
-  rule ADR-0031 recorded and the flag-hyphen rule ADR-0036 added). Nothing that only appears in a span is
-  pronounced, so whatever an agent wants heard has to be in the words it writes around the spans, and a
-  pair of parentheses holding no words is dropped as well: it is what a deleted span leaves behind, not a
-  beat the voice can breathe at. Backticks are paired, so a line with an odd number of them keeps its tail
-  instead of eating the rest of the message.
+  and puts a full stop on it so the voice takes a breath after the heading, replaces the leading `>` of
+  a blockquote line with the word Quote once for a run of consecutive quoted lines (the word names the
+  quote and is the breath where the marker sat), and drops every inline code span wherever it sits, on
+  its own or inside a pair of
+  parentheses (ADR-0039, which supersedes the gloss rule ADR-0031 recorded and the flag-hyphen rule
+  ADR-0036 added). Nothing that only appears in a span is pronounced, so whatever an agent wants
+  heard has to be in the words it writes around the spans, and a pair of parentheses holding no
+  words is dropped as well: it is what a deleted span leaves behind, not a beat the voice can
+  breathe at. Backticks are paired, so a line with an odd number of them keeps its tail instead of
+  eating the rest of the message.
   It is called in `play_one`, where every utterance
   passes — auto speak, `/tts`, `/tts <text>`, a panel audition — and an utterance with nothing speakable
   left in it is not sent at all. The filter is small because `ptts`'s own `preprocess::normalize_text`
   does the rest: braces, square brackets, `*`, list bullets, arrows and emoji arrive as whitespace, `(`
-  `)` `;` arrive as a comma, while a `#` that is not a heading marker and a single hyphen arrive verbatim.
+  `)` `;` arrive as a comma, while a `#` that is not a heading marker, a `>` and a single hyphen arrive
+  verbatim.
   Both halves are printed by
   `cargo run --release --example spoken_text_probe`: the block ` ```rust let x = foo(bar); ``` ` reaches
   the tokenizer as `'''rust let x equals foo, bar, '''` unfiltered and as nothing after the filter, a
   markdown table arrives carrying its pipes, `## The gates` arrives as itself and as "The gates." after the
   filter, "Run the formatter over all targets with the provided command `cargo fmt --all -- --check`."
   arrives with the flag quoted and arrives as "Run the formatter over all targets with the provided
-  command.", and the heading `## Run the formatter (`cargo fmt`)` arrives as `Run the formatter.`
+  command.", the heading `## Run the formatter (`cargo fmt`)` arrives as `Run the formatter.` and the
+  quoted line `> The owner wrote this` arrives with its `>` and arrives as "Quote. The owner wrote this".
 * Audio: the volume dial is applied inside the synthesis chain — `Gain` in decibels, then a `Limiter`
   holding the utterance under −1 dBFS — before the first chunk leaves the model. Each chunk is
   converted to mono s16le and written to the stdin of `ffplay`, the one external program this

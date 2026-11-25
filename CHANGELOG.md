@@ -6,6 +6,10 @@ published CI feeds that section to `gh release create --notes-file`. A Release's
 afterwards; a published tag cannot — which is why the notes live in a tracked file instead of in the
 tag message.
 
+## v1.11.1 — A quote is announced out loud
+
+- **Quote, said aloud.** A quoted line is now announced with the word Quote, once per quote block, and the `>` marker is never spoken.
+
 ## v1.11.0 — Hybrid Voice Mode
 
 - **Hybrid Voice Mode** The extension has a new hybrid mode, where the agent's chat output should be easy to listen to, while also remain easy to read at the same time!
