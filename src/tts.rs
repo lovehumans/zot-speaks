@@ -378,61 +378,104 @@ fn physical_cores_from_cpuinfo(text: &str) -> Option<usize> {
 /// the span rule reaches inside a span only, so a `~~~` fence, a `cmd | grep x` line, a prose `--`, a
 /// prose `a > b`, a line starting with `-->` and a `#` that is not a heading
 /// marker (`#42`) are read as written.
+///
+/// The order above is the order the rulings land in. The fence split and the parenthesis pass run over
+/// the whole text, because each needs to see across lines; [`spoken_line`] holds the rulings that run
+/// over one line, in the order they are ruled to apply.
 pub fn spoken_text(text: &str) -> String {
     let mut kept: Vec<String> = Vec::new();
     for (block, chunk) in text.split("```").enumerate() {
         if block % 2 == 1 {
             continue; // fenced code: the model cannot read it and neither can a listener
         }
-        // A quote block is a run of consecutive quoted lines. A line that is not quoted ends it, and so
-        // does a fence, because every chunk between fences starts with a fresh run. The word that
-        // announces a block is spoken once: on its first line that holds any words at all.
-        let mut quoting = false;
-        let mut announced = false;
+        // A quote block is a run of consecutive quoted lines, and a fence ends one: every chunk between
+        // fences carries a fresh run.
+        let mut quote = QuoteRun::default();
         for line in chunk.lines() {
             if line.trim_start().starts_with('|') {
-                continue;
+                continue; // a table row is invisible to a voice, so it cannot end a run either
             }
-            let quoted = line.trim_start().starts_with('>');
-            if !quoted {
-                quoting = false;
-            } else if !quoting {
-                quoting = true;
-                announced = false;
-            }
-            let line = blockquote_body(line);
-            let line = match spoken_heading(line) {
-                Some(heading) => heading,
-                None => line.to_string(),
-            };
-            // The word goes on after the heading rule, so a heading inside a quote still loses its `#`.
-            let line = if quoted && !announced && !line.trim().is_empty() {
-                announced = true;
-                format!("{QUOTE_INTRO} {line}")
-            } else {
-                line
-            };
-            let pieces: Vec<&str> = line.split('`').collect();
-            // Odd pieces are inside a span. The last piece of a line holding an odd number of
-            // backticks has no opening partner, and a stray backtick must not silence the sentence.
-            let unpaired = pieces.len().is_multiple_of(2);
-            for (piece, content) in pieces.iter().enumerate() {
-                let inside_span = piece % 2 == 1;
-                let stray = unpaired && piece + 1 == pieces.len();
-                if inside_span && !stray {
-                    continue;
-                }
-                kept.push(content.to_string());
-            }
+            kept.push(spoken_line(line, &mut quote));
         }
     }
-    let spoken = kept
+    // The parenthesis pair is judged on the joined text, so a pair opened at one line end and closed on
+    // the next is one pair.
+    let joined = collapse_words(kept.iter().map(String::as_str));
+    collapse_words([drop_wordless_parens(&joined).as_str()])
+}
+
+/// One line as a voice reads it: the marker rules, then the word that opens a quote block, then the
+/// span rule.
+fn spoken_line(line: &str, quote: &mut QuoteRun) -> String {
+    quote.mark(line);
+    let line = blockquote_body(line);
+    let line = match spoken_heading(line) {
+        Some(heading) => heading,
+        None => line.to_string(),
+    };
+    // The word goes on after the heading rule, so a heading inside a quote still loses its `#`, and it
+    // is judged before the span rule, so a quoted line whose only content is a span still gets the word.
+    let line = quote.intro(line);
+    drop_inline_spans(&line)
+}
+
+/// Which quote block the line being read belongs to, and whether that block has been announced yet.
+#[derive(Default)]
+struct QuoteRun {
+    quoting: bool,
+    announced: bool,
+}
+
+impl QuoteRun {
+    /// Note where this line sits: a line that is not quoted ends the run, and the first quoted line of
+    /// a new one is still waiting to be announced.
+    fn mark(&mut self, line: &str) {
+        if !line.trim_start().starts_with('>') {
+            self.quoting = false;
+        } else if !self.quoting {
+            self.quoting = true;
+            self.announced = false;
+        }
+    }
+
+    /// The word that opens a quote block, on its first line holding any words at all, and nothing
+    /// after it.
+    fn intro(&mut self, line: String) -> String {
+        if self.quoting && !self.announced && !line.trim().is_empty() {
+            self.announced = true;
+            format!("{QUOTE_INTRO} {line}")
+        } else {
+            line
+        }
+    }
+}
+
+/// A line with its paired inline code spans gone.
+fn drop_inline_spans(line: &str) -> String {
+    let pieces: Vec<&str> = line.split('`').collect();
+    // Odd pieces are inside a span. The last piece of a line holding an odd number of backticks has no
+    // opening partner, and a stray backtick must not silence the sentence.
+    let unpaired = pieces.len().is_multiple_of(2);
+    pieces
         .iter()
-        .flat_map(|part| part.split_whitespace())
+        .enumerate()
+        .filter(|(piece, _)| {
+            let inside_span = *piece % 2 == 1;
+            let stray = unpaired && *piece + 1 == pieces.len();
+            !(inside_span && !stray)
+        })
+        .map(|(_, content)| *content)
         .collect::<Vec<&str>>()
-        .join(" ");
-    let spoken = drop_wordless_parens(&spoken);
-    spoken.split_whitespace().collect::<Vec<&str>>().join(" ")
+        .join("")
+}
+
+/// The kept parts as one line of words: every run of whitespace becomes a single space.
+fn collapse_words<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    parts
+        .into_iter()
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<&str>>()
+        .join(" ")
 }
 
 /// A parenthesis pair holding no words is a pause with nothing in it, which is what a dropped span
@@ -1034,6 +1077,12 @@ mod tests {
             (
                 "the `filter`(drop code (not the words around it) when dropped) works",
                 "the (drop code (not the words around it) when dropped) works",
+            ),
+            // A pair opened at one line end and closed on the next is one pair, because the pair rule is
+            // judged after the lines are joined.
+            (
+                "notes (`dev/test.sh`\n`dev/test-sink.sh`) end",
+                "notes end",
             ),
             (
                 "Done.\n```rust\nlet x = foo(bar);\n```\nAll green.",

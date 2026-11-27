@@ -24,12 +24,12 @@ extension does and how to run it, see [../README.md](../README.md).
   words is dropped as well: it is what a deleted span leaves behind, not a beat the voice can
   breathe at. Backticks are paired, so a line with an odd number of them keeps its tail instead of
   eating the rest of the message.
-  It is called in `play_one`, where every utterance
-  passes — auto speak, `/tts`, `/tts <text>`, a panel audition — and an utterance with nothing speakable
-  left in it is not sent at all. The filter is small because `ptts`'s own `preprocess::normalize_text`
-  does the rest: braces, square brackets, `*`, list bullets, arrows and emoji arrive as whitespace, `(`
-  `)` `;` arrive as a comma, while a `#` that is not a heading marker, a `>` and a single hyphen arrive
-  verbatim.
+  It is called in `zot_speaks::queue`, where every utterance passes before the pipeline is asked to
+  speak it — auto speak, `/tts`, `/tts <text>`, a panel audition — and an utterance with nothing
+  speakable left in it is never handed to the pipeline at all (ADR-0047). The filter is small because
+  `ptts`'s own `preprocess::normalize_text` does the rest: braces, square brackets, `*`, list bullets,
+  arrows and emoji arrive as whitespace, `(` `)` `;` arrive as a comma, while a `#` that is not a
+  heading marker, a `>` and a single hyphen arrive verbatim.
   Both halves are printed by
   `cargo run --release --example spoken_text_probe`: the block ` ```rust let x = foo(bar); ``` ` reaches
   the tokenizer as `'''rust let x equals foo, bar, '''` unfiltered and as nothing after the filter, a
@@ -88,7 +88,11 @@ running:
 not as a sixth setting. Installing an update is the main way this extension changes under someone, and
 the panel is where you find out whether it landed. Like the body, every footer row stays within 70
 columns, so moving the cursor never changes the panel's height; the caption is padded to exactly that
-width, so it never wraps either. It sits in the body rather than in the footer because a footer is one
+width, so it never wraps either. Every body row is held to that cap by one check at the edge of the
+panel rather than by each row builder clipping its own tail, and what overflows loses the end of its
+value, marked with `…`. In the main view the label column is what gives way first: it is sized to the
+longest label there is (`Temperature`, 11 columns), because a long voice name is rarer than a long
+label. It sits in the body rather than in the footer because a footer is one
 string: zot prints a newline inside it while still counting it as a single row, so each repaint left a
 row of the previous frame standing under the panel.
 
@@ -179,9 +183,9 @@ Temperature adds variety to how a sentence is pronounced.
 * Leaving the row and returning starts it again, so an interrupted row is not permanently silent.
 
 The panel schedules no audio and owns no timer. It asks for the repeat and remembers that it asked
-(`Preview::Explain`); the playback thread is what repeats the line, re-reading the live settings
-before each repetition, until a Stop, a newer request, or an unplayable line ends it — so a broken
-player cannot turn an explanation into an endless retry.
+(`Preview::Explain`); the queue loop (`zot_speaks::queue::speak_queue`) is what repeats the line,
+re-reading the live settings before each repetition, until a Stop, a newer request, or an unplayable
+line ends it — so a broken player cannot turn an explanation into an endless retry.
 
 ## Settings
 
@@ -321,7 +325,7 @@ cwd moves, rather than going on editing the project it happened to open in.
 ## A new message outranks the talk it follows
 
 The extension subscribes to `user_prompt_submit` next to `assistant_message` and `turn_end`, and on
-it sends the same `Cmd::Stop` that `/tts stop` asks for. The host fires the event the moment it
+it sends the same `Request::Stop` that `/tts stop` asks for. The host fires the event the moment it
 accepts what was typed, before that input is appended or queued, which is the earliest moment
 anyone can know the user has moved on. An utterance that answers the message they just replaced has
 nothing left to say, and talking over them is the one thing a reader no longer needs.
@@ -473,6 +477,11 @@ Installing two directories that both register `/tts` gives first-come-first-serv
 of the two commands is silently dead, and the newcomer starts from an empty state file.
 `zot ext logs` keys on the manifest name, so a rename starts a fresh log. `zot ext remove` accepts
 either the manifest name or the directory name.
+
+What a note says never repeats that name: the host labels a note with the extension that wrote it,
+so `/tts` reports `playback unavailable (model failed to load)` rather than naming the extension
+inside its own sentence (ADR-0049). The prefix survives only on stderr, where nothing labels the
+writer — the settings, voice-catalog and model-revision diagnostics.
 
 ## Build and test
 

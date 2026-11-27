@@ -38,9 +38,9 @@
 //!   * What reaches the model is filtered first (`tts::spoken_text`): fenced code, markdown table
 //!     rows and every inline code span are dropped, the last wherever they sit — alone or inside a pair
 //!     of parentheses — so nothing that only appears in code is ever pronounced (ADR-0039), and a heading
-//!     keeps its words with a full stop added after them. Every
-//!     utterance goes through `play_one` — an auto-spoken answer, a `/tts`, a panel audition — so the
-//!     filter lives there and nowhere else.
+//!     keeps its words with a full stop added after them. The filter runs in
+//!     `zot_speaks::queue`, on the way to `play_one`, which every utterance passes through — an
+//!     auto-spoken answer, a `/tts`, a panel audition.
 
 mod panel;
 mod wire;
@@ -52,12 +52,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use ptts::synth::Synth;
 use serde_json::{json, Value};
 
 use zot_speaks::cache;
+use zot_speaks::queue::{self, Outcome, Request, Utterance};
 use zot_speaks::settings::{self, Settings};
 use zot_speaks::sink::Sink;
 use zot_speaks::tts;
@@ -70,50 +70,6 @@ const NAME: &str = "zot-speaks";
 /// One version per artifact: the package version in `Cargo.toml`, which `dev/test.sh` checks
 /// against the version in `extension.json` before it accepts the hello frame.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// The breath between two repetitions of the same line, so a repeated explanation is a sentence you
-/// can follow rather than a stutter. Synthesis time adds to it; this is the floor.
-const LOOP_GAP: Duration = Duration::from_millis(400);
-
-/// One request to the playback thread.
-enum Cmd {
-    /// Speak `text` once, with this exact settings snapshot.
-    Play {
-        text: String,
-        settings: Settings,
-    },
-    /// Speak `text` in `voice` and go on speaking it. The thread re-reads the live settings before
-    /// every repetition, so the value the user is looking at is the value the next one is spoken at.
-    /// This is the `/tts-settings` panel explaining the Temperature row while it is selected.
-    Loop {
-        text: String,
-        voice: String,
-    },
-    /// Cut off whatever is playing and go quiet.
-    Stop,
-    Exit,
-}
-
-/// What the playback thread should do next, as decided by an utterance and the queue behind it.
-enum Resume {
-    /// Go quiet: a Stop had the last word, or the line was not playable at all (no player, a player
-    /// that gave up, no audio in it). A repeat request ends here too, so nothing retries on repeat.
-    Idle,
-    /// The line ran to its end and nothing else is queued. Only a repeat request acts on this; a
-    /// one-shot utterance goes quiet.
-    Finished,
-    /// Speak this once: the newest request in the queue was a one-shot.
-    Play {
-        text: String,
-        settings: Settings,
-    },
-    /// Speak this again and again: the newest request in the queue was a repeat request.
-    Loop {
-        text: String,
-        voice: String,
-    },
-    Exit,
-}
 
 /// The agent messages the host has sent. `assistant_message` and `turn_end` both name the
 /// `session_id` they belong to, and auto-speak answers for a project, not for a session — so with
@@ -164,7 +120,7 @@ fn main() {
 
     let settings = Arc::new(Mutex::new(Settings::default()));
 
-    let (tx, rx): (Sender<Cmd>, Receiver<Cmd>) = mpsc::channel();
+    let (tx, rx): (Sender<Request>, Receiver<Request>) = mpsc::channel();
     let mut player = {
         let out = out.clone();
         let playing = playing.clone();
@@ -263,13 +219,7 @@ fn main() {
                         project = cwd;
                         if panel_open {
                             panel.set_project(project.clone());
-                            out.send(&json!({
-                                "type": "panel_render",
-                                "panel_id": PANEL_ID,
-                                "title": panel.title(),
-                                "lines": panel.lines(),
-                                "footer": panel.footer(),
-                            }));
+                            render_panel(&out, &panel);
                         }
                     }
                 }
@@ -281,7 +231,7 @@ fn main() {
                     // about it. This covers every kind of talk: an auto-spoken answer, a `/tts`,
                     // a panel audition.
                     "user_prompt_submit" => {
-                        let _ = tx.send(Cmd::Stop);
+                        let _ = tx.send(Request::Stop);
                     }
                     "assistant_message" => {
                         if let Some(text) = frame.get("text").and_then(Value::as_str) {
@@ -347,13 +297,7 @@ fn main() {
                                     }
                                 }
                             }
-                            out.send(&json!({
-                                "type": "panel_render",
-                                "panel_id": PANEL_ID,
-                                "title": panel.title(),
-                                "lines": panel.lines(),
-                                "footer": panel.footer(),
-                            }));
+                            render_panel(&out, &panel);
                             // The panel decided what the key means; here we make it audible.
                             if let Some(preview) = preview {
                                 speak_preview(&messages, &tx, &settings, preview);
@@ -362,7 +306,7 @@ fn main() {
                         KeyOutcome::Close => {
                             panel_open = false;
                             // An audition outlives its panel unless we cut it off on the way out.
-                            let _ = tx.send(Cmd::Stop);
+                            let _ = tx.send(Request::Stop);
                             out.send(&json!({"type": "panel_close", "panel_id": PANEL_ID}));
                         }
                     }
@@ -371,12 +315,12 @@ fn main() {
             "panel_close" => {
                 if frame.get("panel_id").and_then(Value::as_str) == Some(PANEL_ID) {
                     panel_open = false;
-                    let _ = tx.send(Cmd::Stop); // closing from the host ends the audition too
+                    let _ = tx.send(Request::Stop); // closing from the host ends the audition too
                 }
             }
             "shutdown" => {
-                let _ = tx.send(Cmd::Stop);
-                let _ = tx.send(Cmd::Exit);
+                let _ = tx.send(Request::Stop);
+                let _ = tx.send(Request::Exit);
                 out.send(&json!({"type": "shutdown_ack"}));
                 join_player(&mut player);
                 return;
@@ -386,7 +330,7 @@ fn main() {
     }
 
     // stdin closed without an explicit shutdown: still end playback cleanly.
-    let _ = tx.send(Cmd::Exit);
+    let _ = tx.send(Request::Exit);
     join_player(&mut player);
 }
 
@@ -398,15 +342,31 @@ fn join_player(player: &mut Option<JoinHandle<()>>) {
     }
 }
 
+/// The repaint frame of an open panel, spelled once: the host redraws it from its id, its title,
+/// its rows in order, and its footer. Opening a panel keeps its own spelling, because that frame
+/// is a command response carrying a request id, and `json!` cannot splat fields into a frame
+/// (measured in serde_json 1.0.154, which has no merge form).
+fn render_panel(out: &Arc<Out>, panel: &SettingsPanel) {
+    out.send(&json!({
+        "type": "panel_render",
+        "panel_id": PANEL_ID,
+        "title": panel.title(),
+        "lines": panel.lines(),
+        "footer": panel.footer(),
+    }));
+}
+
 fn handle_tts(
     out: &Arc<Out>,
     messages: &Arc<Mutex<Messages>>,
     playing: &Arc<AtomicBool>,
-    tx: &Sender<Cmd>,
+    tx: &Sender<Request>,
     settings: &Arc<Mutex<Settings>>,
     id: &str,
     args: &str,
 ) {
+    // Every message below is a note: the host shows it in the notes area, where it already carries
+    // this extension's name, so a message never names the extension itself (ADR-0049).
     let display = |message: &str| {
         out.send(
             &json!({"type": "command_response", "id": id, "action": "display", "display": message}),
@@ -416,11 +376,11 @@ fn handle_tts(
     if args == "stop" {
         // Report what we believed was happening; the playback thread does the cooperative stop.
         let was_playing = playing.load(Ordering::SeqCst);
-        let _ = tx.send(Cmd::Stop);
+        let _ = tx.send(Request::Stop);
         display(if was_playing {
-            "zot-speaks: stopped"
+            "stopped"
         } else {
-            "zot-speaks: nothing playing"
+            "nothing playing"
         });
         return;
     }
@@ -433,20 +393,20 @@ fn handle_tts(
         (messages.lock().unwrap().newest.clone(), "last message")
     };
     if text.is_empty() {
-        display("zot-speaks: nothing to speak yet");
+        display("nothing to speak yet");
         return;
     }
 
     // Snapshot the current settings so a `/tts` honours the latest panel edits.
     let snapshot = settings.lock().unwrap().clone();
-    out.notify("info", &format!("zot-speaks: synthesizing {src}…"));
-    match tx.send(Cmd::Play {
+    out.notify("info", &format!("synthesizing {src}…"));
+    match tx.send(Request::Play {
         text,
         settings: snapshot,
     }) {
         // Reply immediately; audio is streamed on the playback thread.
         Ok(()) => out.send(&json!({"type": "command_response", "id": id, "action": "noop"})),
-        Err(_) => display("zot-speaks: playback unavailable (model failed to load)"),
+        Err(_) => display("playback unavailable (model failed to load)"),
     }
 }
 
@@ -468,7 +428,7 @@ fn is_final_stop(stop: &str) -> bool {
 /// notification of its own.
 fn auto_speak(
     messages: &Arc<Mutex<Messages>>,
-    tx: &Sender<Cmd>,
+    tx: &Sender<Request>,
     settings: &Arc<Mutex<Settings>>,
     project: &Path,
     session: &str,
@@ -481,7 +441,7 @@ fn auto_speak(
     if text.trim().is_empty() {
         return;
     }
-    let _ = tx.send(Cmd::Play {
+    let _ = tx.send(Request::Play {
         text,
         settings: snapshot,
     });
@@ -494,7 +454,7 @@ fn auto_speak(
 /// queue behind it.
 fn speak_preview(
     messages: &Arc<Mutex<Messages>>,
-    tx: &Sender<Cmd>,
+    tx: &Sender<Request>,
     settings: &Arc<Mutex<Settings>>,
     preview: Preview,
 ) {
@@ -506,178 +466,91 @@ fn speak_preview(
             // Only the voice travels with a repeated line: the thread reads the rest of the settings
             // again before each repetition, which is how a temperature you just stepped is heard in
             // the next sentence.
-            let _ = tx.send(Cmd::Loop { text, voice });
+            let _ = tx.send(Request::Loop { text, voice });
             return;
         }
         Preview::Silence => {
-            let _ = tx.send(Cmd::Stop);
+            let _ = tx.send(Request::Stop);
             return;
         }
     };
     if text.trim().is_empty() {
         // Nothing to audition: at least leave the panel quiet.
-        let _ = tx.send(Cmd::Stop);
+        let _ = tx.send(Request::Stop);
         return;
     }
     // An audition changes only the voice; volume and temperature stay as the settings have them.
     let request = Settings { voice, ..base };
-    let _ = tx.send(Cmd::Play {
+    let _ = tx.send(Request::Play {
         text,
         settings: request,
     });
 }
 
 /// Own the `Synth` on a dedicated thread: load it once (in the background, while the protocol is
-/// already live), then serve Play/Loop/Stop/Exit commands. A request enqueued during warmup sits in
-/// the channel until we start reading.
+/// already live), then speak what the queue asks for. A request enqueued during warmup sits in the
+/// channel until the loop starts reading it.
 fn playback_thread(
     out: Arc<Out>,
     playing: Arc<AtomicBool>,
     current: Arc<Mutex<Settings>>,
-    rx: Receiver<Cmd>,
+    rx: Receiver<Request>,
     catalog: Vec<VoiceInfo>,
 ) {
-    out.notify("info", "zot-speaks: loading Phonon model…");
+    out.notify("info", "loading Phonon model…");
     let synth = match tts::load_synth(&catalog) {
         Ok(synth) => synth,
         Err(e) => {
-            out.notify("error", &format!("zot-speaks: model load failed: {e}"));
+            out.notify("error", &format!("model load failed: {e}"));
             return; // /tts will report playback unavailable
         }
     };
-    out.notify(
-        "info",
-        &format!("zot-speaks: ready ({} Hz).", synth.sample_rate()),
-    );
+    out.notify("info", &format!("ready ({} Hz).", synth.sample_rate()));
 
     // One noise seed per utterance, drawn as the utterance starts. With ptts' own default the same
     // sentence would come back as the identical take every time it is spoken.
     let seeds = tts::SeedPlan::from_env();
 
-    loop {
-        let request = match rx.recv() {
-            Ok(Cmd::Play { text, settings }) => Resume::Play { text, settings },
-            Ok(Cmd::Loop { text, voice }) => Resume::Loop { text, voice },
-            Ok(Cmd::Stop) => continue, // idle: nothing to stop
-            Ok(Cmd::Exit) => return,
-            Err(_) => return, // all senders dropped
-        };
-        if !serve(&synth, &seeds, &out, &playing, &current, &rx, request) {
-            return;
-        }
-    }
+    // What to speak next is the library's decision (ADR-0047). What speaking one utterance means is
+    // ours, and `play_one` reads the same queue the loop drains.
+    queue::speak_queue(&rx, &current, &mut |utterance| {
+        play_one(&synth, &seeds, &out, &playing, &rx, utterance)
+    });
 }
 
-/// Play what was asked for, and then whatever the queue asks for, until something says otherwise.
-/// A `Resume::Loop` is what makes this a repeating utterance: when a repetition ends with nothing
-/// else queued, the same line is spoken again from the live settings, so the temperature on screen is
-/// the temperature you hear in the next sentence. Anything else is one utterance. The coalescing that
-/// used to live here is now `coalesce`, applied before every utterance rather than only around the
-/// ones a held key produced.
-///
-/// Returns false when the thread should exit.
-fn serve(
-    synth: &Synth,
-    seeds: &tts::SeedPlan,
-    out: &Arc<Out>,
-    playing: &Arc<AtomicBool>,
-    current: &Arc<Mutex<Settings>>,
-    rx: &Receiver<Cmd>,
-    request: Resume,
-) -> bool {
-    let mut next = request;
-    loop {
-        let (text, settings, repeat) = match coalesce(rx, next) {
-            Resume::Play { text, settings } => (text, settings, false),
-            Resume::Loop { text, voice } => (text, live_settings(current, &voice), true),
-            Resume::Idle | Resume::Finished => return true, // nothing left to say
-            Resume::Exit => return false,
-        };
-        match play_one(synth, seeds, out, playing, rx, &text, &settings) {
-            // Stopped, or nothing playable: go quiet.
-            Resume::Idle => return true,
-            Resume::Exit => return false,
-            // The line said its piece and nothing else is queued. That is the one moment a repeat
-            // repeats, and a breath comes first so it lands as a sentence and not a stutter.
-            Resume::Finished if repeat => {
-                thread::sleep(LOOP_GAP);
-                next = Resume::Loop {
-                    text,
-                    voice: settings.voice.clone(),
-                };
-            }
-            Resume::Finished => return true,
-            // Cut short by a newer request, which decides what comes next, repeating included.
-            Resume::Play { text, settings } => next = Resume::Play { text, settings },
-            Resume::Loop { text, voice } => next = Resume::Loop { text, voice },
-        }
-    }
-}
-
-/// A request superseded mid-stream is usually a held arrow key in the picker: one preview per step,
-/// all of them now pointless. Drain the queue and keep only the newest request, so the voice under
-/// the cursor is the one you hear instead of a backlog of voices you walked past. A drain that found
-/// nothing hands back the request it was given, which is what makes a repeat keep repeating.
-fn coalesce(rx: &Receiver<Cmd>, request: Resume) -> Resume {
-    let mut latest = request;
-    loop {
-        match rx.try_recv() {
-            Ok(Cmd::Play { text, settings }) => latest = Resume::Play { text, settings },
-            Ok(Cmd::Loop { text, voice }) => latest = Resume::Loop { text, voice },
-            Ok(Cmd::Stop) => latest = Resume::Idle,
-            Ok(Cmd::Exit) => return Resume::Exit,
-            Err(TryRecvError::Empty) => return latest,
-            Err(TryRecvError::Disconnected) => return Resume::Exit,
-        }
-    }
-}
-
-/// The settings a repetition is spoken at: the shared live settings — so the value on screen is the
-/// value you hear — carried in the voice the explanation was started in, which is the voice the user
-/// is listening to.
-fn live_settings(current: &Arc<Mutex<Settings>>, voice: &str) -> Settings {
-    Settings {
-        voice: voice.to_string(),
-        ..current.lock().unwrap().clone()
-    }
-}
-
-/// Synthesize + stream one text under the given settings, watching for a cooperative Stop or a
-/// superseding Play between PCM chunks. `seeds` is asked for one seed per utterance, which is what
-/// makes a repeated line a new take rather than the same one replayed. Returns what the caller
-/// should do next.
+/// Synthesize + stream one utterance, watching for a cooperative Stop or a superseding request
+/// between PCM chunks. `seeds` is asked for one seed per utterance, which is what makes a repeated
+/// line a new take rather than the same one replayed. The text arrives already filtered, by the queue
+/// that decided this line was worth speaking (`queue::utterance_for`), and a request this control
+/// point takes out of the queue is reported back as `Outcome::Next`: the loop is what speaks it next.
 fn play_one(
     synth: &Synth,
     seeds: &tts::SeedPlan,
     out: &Arc<Out>,
     playing: &AtomicBool,
-    rx: &Receiver<Cmd>,
-    text: &str,
-    settings: &Settings,
-) -> Resume {
-    // What a voice cannot read is not spoken (see `tts::spoken_text`). Asked for before the options are
-    // built, so an utterance that will not happen costs no noise seed and no voice warning.
-    let spoken = tts::spoken_text(text);
-    if spoken.is_empty() {
-        // Nothing in it a voice could say: an answer that is only a code block or only a table goes
-        // quiet rather than feeding the model an empty request.
-        return Resume::Idle;
-    }
+    rx: &Receiver<Request>,
+    utterance: &Utterance,
+) -> Outcome {
+    let (spoken, settings) = match utterance {
+        Utterance::Play { spoken, settings } | Utterance::Loop { spoken, settings } => {
+            (spoken, settings)
+        }
+    };
     let (options, used_voice) = tts::build_options(synth, settings, seeds.next());
     if !settings.voice.is_empty() && used_voice.is_none() {
         out.notify(
             "warn",
             &format!(
-                "zot-speaks: voice '{}' is not registered locally; using default",
+                "voice '{}' is not registered locally; using default",
                 settings.voice
             ),
         );
     }
-    let mut stream = match synth.stream_with(&spoken, &options) {
+    let mut stream = match synth.stream_with(spoken, &options) {
         Ok(stream) => stream,
         Err(e) => {
-            out.notify("error", &format!("zot-speaks: synthesis failed: {e}"));
-            return Resume::Idle;
+            out.notify("error", &format!("synthesis failed: {e}"));
+            return Outcome::Quiet;
         }
     };
     let rate = stream.sample_rate();
@@ -690,8 +563,8 @@ fn play_one(
         Err(e) => {
             // "Not installed", "present but not startable" and "no stdin" are three different
             // sentences and Sink names them; only the first is an install hint.
-            out.notify("error", &format!("zot-speaks: {}", e.report()));
-            return Resume::Idle;
+            out.notify("error", &e.report());
+            return Outcome::Quiet;
         }
     };
 
@@ -701,7 +574,7 @@ fn play_one(
     out.notify(
         "info",
         &format!(
-            "zot-speaks: speaking as {} at temp {:.2}, vol {:.0}%, speed {}",
+            "speaking as {} at temp {:.2}, vol {:.0}%, speed {}",
             used_voice.clone().unwrap_or_else(|| "default".to_string()),
             options.temperature.unwrap_or(0.0),
             settings.volume * 100.0,
@@ -710,9 +583,9 @@ fn play_one(
     );
 
     playing.store(true, Ordering::SeqCst);
-    // An utterance that reaches the end of its stream has finished; that is what a repeat request
-    // waits for. A Stop, a player that gave up, or a line with no audio in it says `Idle` instead.
-    let mut resume = Resume::Finished;
+    // An utterance that reaches the end of its stream has finished; that is what a repeat waits for.
+    // A Stop, a player that gave up, or a line with no audio in it reports `Quiet` instead.
+    let mut outcome = Outcome::Finished;
     // Audio the user has moved on from: drives the bounded grace at the teardown below.
     let mut cut_short = false;
 
@@ -727,38 +600,34 @@ fn play_one(
                 }
             }
             Err(e) => {
-                out.notify("error", &format!("zot-speaks: stream error: {e}"));
+                out.notify("error", &format!("stream error: {e}"));
                 break;
             }
         }
 
         // Cooperative control point: between chunks, honor Stop / new Play / new Loop / Exit.
         match rx.try_recv() {
-            Ok(Cmd::Stop) => {
-                resume = Resume::Idle;
+            Ok(Request::Stop) => {
+                outcome = Outcome::Quiet;
                 cut_short = true;
                 break;
             }
-            Ok(Cmd::Play { text, settings }) => {
-                resume = Resume::Play { text, settings };
-                cut_short = true;
-                break;
-            }
-            Ok(Cmd::Loop { text, voice }) => {
+            Ok(request @ (Request::Play { .. } | Request::Loop { .. })) => {
                 // The panel wants this line said on repeat. Cutting this utterance short is right
                 // even when it is that very line playing: the panel only asks for a repeat when it
-                // has stopped asking, so what follows is the same sentence at a new value.
-                resume = Resume::Loop { text, voice };
+                // has stopped asking, so what follows is the same sentence at a new value. The
+                // request is reported back, because the loop is what speaks it next.
+                outcome = Outcome::Next(request);
                 cut_short = true;
                 break;
             }
-            Ok(Cmd::Exit) => {
-                resume = Resume::Exit;
+            Ok(Request::Exit) => {
+                outcome = Outcome::Next(Request::Exit);
                 break;
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
-                resume = Resume::Exit;
+                outcome = Outcome::Next(Request::Exit);
                 break;
             }
         }
@@ -771,23 +640,22 @@ fn play_one(
     // it has to say about how its run ended. A player that gave up is not worth repeating after.
     let finished = sink.finish(cut_short);
     if let Some(reason) = finished.failure() {
-        out.notify("error", &format!("zot-speaks: {reason}"));
-        resume = Resume::Idle;
+        out.notify("error", reason);
     }
-    // A line that produced no audio at all is nothing to repeat either; otherwise a broken player
-    // would make an explanation retry forever.
-    if finished.silent() {
-        resume = Resume::Idle;
+    // A player that gave up is not worth repeating after, and neither is a line that produced no
+    // audio at all; otherwise a broken player would make an explanation retry forever. An `Exit` the
+    // control point took is the one report this teardown may not overrule, because the loop has to
+    // hear about it before it goes back to waiting for a request that will never arrive.
+    let exiting = matches!(outcome, Outcome::Next(Request::Exit));
+    if !exiting && (finished.failure().is_some() || finished.silent()) {
+        outcome = Outcome::Quiet;
     }
-    resume
+    outcome
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{coalesce, is_final_stop, live_settings, Cmd, Messages, Resume};
-    use std::sync::mpsc::{self, Sender};
-    use std::sync::{Arc, Mutex};
-    use zot_speaks::settings::Settings;
+    use super::{is_final_stop, Messages};
 
     /// Auto-speak hangs on this gate, so it is worth naming the values out loud. The host's own
     /// name for a finished answer (`end`, what zot puts on the wire) and the provider's name the
@@ -833,74 +701,5 @@ mod tests {
             "a slot holds its latest message"
         );
         assert_eq!(m.newest, "third", "/tts reads what was last written");
-    }
-
-    /// A repeat repeats because a drain that found nothing hands back the request it was given: the
-    /// queue is the only thing that ends it. So the queue's three ways of ending one have to win in
-    /// the right order — a Stop, a newer request, an Exit.
-    #[test]
-    fn coalescing_repeats_until_the_queue_says_otherwise() {
-        let repeat = || Resume::Loop {
-            text: "one line".to_string(),
-            voice: "Miles".to_string(),
-        };
-        let (tx, rx) = mpsc::channel();
-        assert!(
-            matches!(coalesce(&rx, repeat()), Resume::Loop { .. }),
-            "an empty drain must hand the repeat back, not drop it"
-        );
-        tx.send(Cmd::Stop).unwrap();
-        assert!(
-            matches!(coalesce(&rx, repeat()), Resume::Idle),
-            "a Stop ends a repeat"
-        );
-        tx.send(Cmd::Loop {
-            text: "another line".to_string(),
-            voice: "Zoey".to_string(),
-        })
-        .unwrap();
-        match coalesce(&rx, repeat()) {
-            Resume::Loop { text, voice } => {
-                assert_eq!((text.as_str(), voice.as_str()), ("another line", "Zoey"))
-            }
-            _ => panic!("the newest request should win over the one it supersedes"),
-        }
-        tx.send(Cmd::Exit).unwrap();
-        assert!(
-            matches!(coalesce(&rx, repeat()), Resume::Exit),
-            "exit outranks a repeat"
-        );
-        // The drain itself is what the thread blocks on between utterances, so a sender that is
-        // still alive must never look like an ended conversation.
-        let held: Sender<Cmd> = tx.clone();
-        assert!(matches!(coalesce(&rx, repeat()), Resume::Loop { .. }));
-        drop(held);
-        drop(tx);
-        assert!(
-            matches!(coalesce(&rx, repeat()), Resume::Exit),
-            "a closed queue is an exit"
-        );
-    }
-
-    /// Every repetition is spoken at the settings the panel is showing, but in the voice the
-    /// explanation started in: the row the user is on is the value they are hearing, and the voice
-    /// they picked is the one they are listening to.
-    #[test]
-    fn a_repetition_follows_the_live_settings_but_keeps_its_voice() {
-        let live = Arc::new(Mutex::new(Settings {
-            temperature: 0.70,
-            volume: 0.40,
-            ..Settings::default()
-        }));
-        let spoken = live_settings(&live, "Zoey");
-        assert_eq!(spoken.voice, "Zoey", "a repeat keeps its voice");
-        assert!(
-            (spoken.temperature - 0.70).abs() < 1e-6,
-            "a repeat hears the temperature on screen"
-        );
-        assert!(
-            (spoken.volume - 0.40).abs() < 1e-6,
-            "a repeat follows the dial as it moves"
-        );
     }
 }

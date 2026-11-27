@@ -71,6 +71,13 @@ const DETAIL_ROWS: usize = 2;
 const DETAIL_WIDTH: usize = 70;
 const ROW_INDENT: usize = 2;
 const DETAIL_TEXT_WIDTH: usize = DETAIL_WIDTH - ROW_INDENT;
+/// A main row's label column: the width of the longest label the main view has, `Temperature`, and a
+/// value is separated from that column by one space rather than by the padding alone, so the shortest
+/// rows are not butted against their own names. It is the column that gives way when a Voice row
+/// carries a long name, so the name, its star and the catalog count beside it stay whole (see the
+/// width guard in `lines`). With the shipped catalog this leaves the Voice row exactly at
+/// `DETAIL_WIDTH`: a count that grows past two digits is what gets clipped, and never a voice name.
+const LABEL_WIDTH: usize = 11;
 /// The panel's own identity, as its last body row. `CARGO_PKG_NAME` is the name `extension.json`
 /// registers, so this names exactly what `zot ext list` and the installer report: the question
 /// "did the update land?" is answerable from the panel.
@@ -228,12 +235,24 @@ impl SettingsPanel {
         // What we are running, on the panel's last row and right-aligned, so it reads as a caption
         // and not as a sixth setting. It is a body row rather than part of the footer because a footer
         // is one string: zot prints a newline inside it but counts the footer as one row, so each
-        // repaint leaves a row of the previous frame behind the panel. Padded to `DETAIL_WIDTH`, this
-        // row is exactly as wide as the widest body row and is therefore never wrapped either.
+        // repaint leaves a row of the previous frame behind the panel. Padded to `DETAIL_WIDTH`, the
+        // cap every row of this frame is held to, it is never wrapped either.
         lines.push(format!(
             "{}{IDENTITY_LINE}",
             " ".repeat(DETAIL_WIDTH - IDENTITY_LINE.chars().count())
         ));
+        // One width guard for every row the panel emits, here rather than in each row builder: zot
+        // wraps a body line to the terminal width and gives us no width to work with, and a wrapped
+        // row is a panel that changes height between repaints (ADR-0014). What is over the cap loses
+        // its tail, marked with `…`, rather than a name or a label losing columns. Two builders keep
+        // their own arithmetic: `detail_lines` wraps to `DETAIL_TEXT_WIDTH` because it is the only
+        // code that knows the description block is exactly `DETAIL_ROWS` indented rows, and `footer`
+        // is left whole because clipping it would drop a key hint (ADR-0021).
+        for line in lines.iter_mut() {
+            if line.chars().count() > DETAIL_WIDTH {
+                clip(line, DETAIL_WIDTH);
+            }
+        }
         lines
     }
 
@@ -349,7 +368,7 @@ impl SettingsPanel {
                 block = current;
             }
             let marker = if index == self.voice_idx { ">" } else { " " };
-            let mut line = if voice.available {
+            let line = if voice.available {
                 format!(
                     "{} {:<w$} │ {}",
                     marker,
@@ -368,10 +387,8 @@ impl SettingsPanel {
                 )
             };
             // A name long enough to push the row past the wrap column would make zot split it
-            // in two and change the list's height, so the metadata tail gives way instead.
-            if line.chars().count() > DETAIL_WIDTH {
-                clip(&mut line, DETAIL_WIDTH);
-            }
+            // in two and change the list's height; the width guard in `lines` cuts the metadata
+            // tail instead.
             lines.push(line);
         }
         // Detail block for the highlighted voice, at a fixed height (see `detail_lines`).
@@ -419,7 +436,7 @@ impl SettingsPanel {
 
     fn row(&self, index: usize, label: &str, value: &str) -> String {
         let marker = if index == self.focus { ">" } else { " " };
-        format!("{marker} {:<13}{}", label, value)
+        format!("{marker} {:<w$} {}", label, value, w = LABEL_WIDTH)
     }
 
     pub fn on_key(&mut self, key: &str, text: &str) -> KeyOutcome {
@@ -1378,6 +1395,58 @@ mod tests {
                 line.chars().count()
             );
         }
+    }
+
+    #[test]
+    fn the_longest_voice_name_keeps_the_main_panel_on_one_screen_row() {
+        // The main view has no guard of its own, and no test looked at it: a Voice row over the
+        // wrap column is split by zot into two screen rows, which is the height change ADR-0014
+        // was written for. This is the widest row the shipped catalog can produce.
+        let mut panel = SettingsPanel::new(longest_name_catalog());
+        panel.open(&Settings {
+            voice: "The Thing Under the Stairs".into(),
+            favorites: vec!["The Thing Under the Stairs".into()],
+            ..Settings::default()
+        });
+        let lines = panel.lines();
+        assert_eq!(lines.len(), ROWS + CAPTION_ROWS, "panel height: {lines:?}");
+        for line in &lines {
+            assert!(
+                line.chars().count() <= DETAIL_WIDTH,
+                "row too wide ({} cols): {line}",
+                line.chars().count()
+            );
+        }
+        // The label column is what gives way, so the row keeps everything it says: the name, the
+        // star a pinned voice earns, and the catalog count beside it.
+        assert!(
+            lines[VOICE_ROW].contains("The Thing Under the Stairs ★"),
+            "a long name lost something: {}",
+            lines[VOICE_ROW]
+        );
+        assert!(
+            lines[VOICE_ROW].contains("37 ready of 37 en voices"),
+            "the catalog count vanished: {}",
+            lines[VOICE_ROW]
+        );
+        // The longest label still keeps its separating space: `Temperature` is exactly as wide as the
+        // column, so a padding-only column would read as `Temperature0.30`.
+        assert!(
+            lines[TEMPERATURE_ROW].contains("Temperature 0.30"),
+            "the label column lost its separator: {}",
+            lines[TEMPERATURE_ROW]
+        );
+    }
+
+    /// The shipped English catalog's worst case for the Voice row: its longest name, 26 characters
+    /// (`The Thing Under the Stairs`), and 37 voices of 37 ready, so the count beside the name is
+    /// as long as it ever gets.
+    fn longest_name_catalog() -> Vec<VoiceInfo> {
+        let mut voices = (1..37)
+            .map(|n| voice(&format!("Voice {n}"), true))
+            .collect::<Vec<_>>();
+        voices.insert(0, voice("The Thing Under the Stairs", true));
+        voices
     }
 
     #[test]

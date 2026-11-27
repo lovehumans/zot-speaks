@@ -67,7 +67,8 @@ pub enum SinkError {
 }
 
 impl SinkError {
-    /// The sentence for the user, without the `zot-speaks: ` prefix the extension puts on everything.
+    /// The sentence for the user, as the note itself: the notes area labels it with the extension's
+    /// own name, so it carries no prefix here.
     pub fn report(&self) -> String {
         match self {
             SinkError::MissingPlayer => NO_PLAYER_HINT.to_string(),

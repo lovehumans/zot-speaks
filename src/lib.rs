@@ -6,12 +6,15 @@
 //! one reason: `examples/` then measures the pipeline the extension actually ships (cache
 //! precedence, inference-pool sizing, `Quant::F32`, voice registration) instead of a
 //! reimplementation of it that can drift. The same reasoning puts the audio sink here rather than
-//! inline in the playback loop: its rules are the product's, and they get the tests CI runs.
+//! inline in the playback loop: its rules are the product's, and they get the tests CI runs. The
+//! loop that decides what to speak next, and what the queue behind it decides, is `queue`; the
+//! utterance pipeline that speaks one utterance is in the binary (ADR-0047).
 //!
 //! Nothing here reaches the network. `ptts` is built without its `hub` feature, and every model and
 //! voice is resolved from the Hugging Face cache read-only.
 
 pub mod cache;
+pub mod queue;
 pub mod settings;
 pub mod sink;
 pub mod tts;

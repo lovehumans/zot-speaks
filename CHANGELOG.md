@@ -6,6 +6,10 @@ published CI feeds that section to `gh release create --notes-file`. A Release's
 afterwards; a published tag cannot — which is why the notes live in a tracked file instead of in the
 tag message.
 
+## v1.11.2 — A note no longer names the extension
+
+- **Shorter notes.** zot already labels a note with the extension that sent it, so this extension stopped writing its own name into the sentence: a note now reads `speaking as Maeve at temp 1.00, vol 100%, speed 1.0x`, and `/tts` answers `playback unavailable (model failed to load)` instead of naming itself. Lines in the extension's log keep the name, because nothing there labels who wrote them.
+
 ## v1.11.1 — A quote is announced out loud
 
 - **Quote, said aloud.** A quoted line is now announced with the word Quote, once per quote block, and the `>` marker is never spoken.

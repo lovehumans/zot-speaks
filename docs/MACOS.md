@@ -43,7 +43,7 @@ rather than a nicety (ADR-0019).
 | `ffplay` | `ffplay -nodisp -autoexit -loglevel error -f s16le -ar <rate> -ch_layout mono [-af atempo=<speed>] -` |
 
 One raw PCM stream, one write loop, one stop path, no `cfg!`. The notification names the voice and
-the rate it is spoken at — `zot-speaks: speaking as Alice at temp 0.7, vol 100%, speed 1.2x` — and
+the rate it is spoken at — `speaking as Alice at temp 0.7, vol 100%, speed 1.2x` — and
 the player is mentioned only when it fails.
 
 `ZOT_SPEAKS_SINK` and `paplay` existed up to 1.8.2 and are gone: setting that variable now does
@@ -59,7 +59,7 @@ natural rate and `ffplay` is asked for the tempo (`-af atempo=1.2`), which stret
 shifting the pitch.
 
 If `ffplay` starts and then gives up, its own words are reported as an error
-(`zot-speaks: ffplay stopped: <its own reason>`) — never a silent failure. Its words have to be the
+(`ffplay stopped: <its own reason>`) — never a silent failure. Its words have to be the
 report: measured with `ffplay` n9.0.2, an unopenable audio device, an unreadable input and an unknown
 filter each exit with status **0**, so the exit code alone would call a run that played nothing a
 success. Only lines that name a fatal failure count; the warnings a healthy box writes to the same
